@@ -1,9 +1,10 @@
 #include "session.hpp"
+#include "depth_update.hpp"
 #include "util.hpp"
-#include "validation.hpp"
 
 #include <boost/asio/connect.hpp>
 
+#include <cstdlib>
 #include <iostream>
 
 Session::Session(net::io_context& ioc, ssl::context& ctx,
@@ -153,15 +154,26 @@ void Session::on_read(beast::error_code ec, std::size_t bytes_transferred) {
     stats_.messages_received++;
     stats_.bytes_received += bytes_transferred;
 
-    auto result = validate_depth_message(data);
-    if (!result.ok) {
+    // MARKET_DATA_RAW=1 prints raw JSON to stdout for debugging.
+    static bool const raw_mode = std::getenv("MARKET_DATA_RAW") != nullptr;
+    if (raw_mode)
+        std::cout << '[' << timestamp_now() << "] " << data << '\n';
+
+    auto result = parse_depth_update(data);
+    if (auto* err = std::get_if<ParseError>(&result)) {
         stats_.invalid_messages++;
         auto preview = data.substr(0, 120);
-        std::cerr << "invalid message: " << result.error << " | " << preview
+        std::cerr << "parse error: " << err->message << " | " << preview
                   << '\n';
+    } else {
+        auto const& update = std::get<DepthUpdate>(result);
+        std::cerr << '[' << timestamp_now() << "] " << update.symbol
+                  << " U=" << update.first_update_id
+                  << " u=" << update.last_update_id
+                  << " bids=" << update.bids.size()
+                  << " asks=" << update.asks.size()
+                  << " E=" << update.event_time << '\n';
     }
-
-    std::cout << '[' << timestamp_now() << "] " << data << '\n';
 
     buffer_.consume(bytes_transferred);
     do_read();

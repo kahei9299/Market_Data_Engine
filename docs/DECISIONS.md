@@ -122,3 +122,88 @@ Using the production endpoint, not testnet. Read-only with a single connection �
 ### Build: CMake + Ninja with static library
 
 `CMakeLists.txt` compiles non-main sources into a static library (`engine_core`). Both the main executable and the test executable link against it, avoiding compiling shared sources twice. Ninja is used for fast incremental builds. C++20 is required for `std::chrono` improvements and modern language features.
+
+## M1.2 — Typed Depth Message Parsing
+
+### Numeric representation: signed 64-bit scaled integers
+
+**Problem:** Binance sends prices and quantities as decimal strings (e.g. `"78450.06000000"`). The engine needs a numeric type for arithmetic that is exact — no rounding.
+
+**Options considered:**
+- `double` — simple, native arithmetic, but IEEE 754 cannot represent all 8-decimal-place values exactly. `78450.06` is not representable; the nearest double is `78450.05999999999...`. Rounding errors accumulate in order-book reconstruction.
+- `std::string` — no precision loss, but arithmetic requires re-parsing every operation. Impractical for an order book.
+- `int64_t` with fixed scale 10^8 — exact representation of all Binance values. Arithmetic is integer arithmetic (fast, deterministic). Requires explicit scale tracking.
+- Decimal library (e.g. `boost::multiprecision`) — exact, but heavy dependency for what 64-bit integers already solve.
+
+**Selected:** `int64_t` scaled by `kScaleFactor = 100'000'000` (10^8), defined in `src/util.hpp`. `"78450.06000000"` becomes `7845006000000`. The scale matches Binance's `baseAssetPrecision` and `quotePrecision` of 8 for all current Spot pairs.
+
+Prices are stored as signed `int64_t` (not unsigned) because signed arithmetic avoids unsigned underflow surprises in future subtraction operations (e.g. spread calculation). Parse-time validation rejects negative values.
+
+**Tradeoff:** Every consumer must know the scale factor. Overflow is possible for values above ~92 billion at scale 10^8 — rejected at parse time.
+
+**Revisit if:** A Binance Spot pair exceeds 8 decimal places (currently none do), or if 64-bit range proves insufficient for aggregated quantities.
+
+### Parse result: `std::variant<DepthUpdate, ParseError>`
+
+**Problem:** A failed parse must never expose a partially constructed `DepthUpdate`. The return type must make partial state impossible.
+
+**Options considered:**
+- `std::variant<DepthUpdate, ParseError>` — type-safe union. You have one or the other, never both. Access via `std::get_if` or `std::visit`.
+- `struct { bool ok; DepthUpdate event; ParseError error; }` — allows reading `event` when `ok` is false.
+- `std::expected<DepthUpdate, ParseError>` — cleaner monadic API, but C++23. Not available in C++20.
+- Throw on parse failure — expensive for expected errors from untrusted network input.
+
+**Selected:** `std::variant`. Defined in `src/depth_update.hpp`. The variant makes partial-state impossible at the type level. C++20 compatible.
+
+**Revisit if:** C++23 is adopted — `std::expected` has a cleaner API for value-or-error.
+
+### Decimal string parsing without floating-point
+
+**Problem:** Converting `"78450.06000000"` to a scaled integer without going through `double`.
+
+**Selected:** `parse_scaled_decimal()` in `src/util.cpp`. Algorithm:
+1. Split at the decimal point.
+2. Parse integer and fractional parts separately using `std::from_chars` (no locale, no allocation, no floating-point).
+3. Check overflow before scaling: `integer > INT64_MAX / kScaleFactor` rejects.
+4. Scale fractional part by padding with trailing zeros to 8 digits.
+5. Combine: `integer * kScaleFactor + fractional`.
+
+Rejects: >8 decimal places, negative values, empty input, non-numeric characters, trailing dot with no digits, integer overflow.
+
+**Why `std::from_chars`:** It parses directly from a `string_view` without allocating a `std::string`, does not depend on locale settings, and reports exact parse boundaries (detects trailing garbage).
+
+**Revisit if:** Performance profiling shows `from_chars` is a bottleneck (unlikely — it's highly optimized in libc++).
+
+### Removed `validation.hpp/cpp` — parsing subsumes validation
+
+**Problem:** M1.1's `validate_depth_message()` checked top-level JSON structure. M1.2's `parse_depth_update()` does the same checks and also extracts values.
+
+**Selected:** Removed `validation.hpp` and `validation.cpp`. The parser validates structure as it parses — running a separate validation pass first would parse the JSON twice for every message. The M1.1 validation tests were migrated to the parser test suite.
+
+### Debug output via `MARKET_DATA_RAW` environment variable
+
+**Problem:** M1.1 printed raw JSON to stdout. M1.2 replaces this with a decoded summary on stderr. Raw output is still useful for debugging.
+
+**Options considered:**
+- Remove raw output entirely — use external tools if needed.
+- Environment variable `MARKET_DATA_RAW=1` — runtime toggle, zero code complexity.
+- Command-line flag `--raw` — requires argument parsing.
+- Log-level system — more infrastructure than needed.
+
+**Selected:** Environment variable, checked once at startup via `std::getenv`. When set, raw JSON is printed to stdout alongside the decoded summary on stderr.
+
+**Revisit if:** A proper CLI argument parser is added for other reasons.
+
+### Validation strictness
+
+**Problem:** What to accept and reject when parsing untrusted exchange data.
+
+**Selected policy:**
+- Prices must be strictly positive (`> 0`). A zero-price order is meaningless.
+- Quantities must be nonnegative (`>= 0`). Zero quantity is a valid deletion signal (see GLOSSARY.md).
+- Sequence range: `U <= u`. If `U > u`, the update is malformed.
+- Each price-level entry must be a 2-element array of strings. Numeric JSON values are rejected — Binance always sends strings.
+- Decimal precision capped at 8 digits. More digits are rejected rather than silently truncated.
+- Integer overflow is checked before scaling and rejected with a clear error.
+
+Invalid messages increment `stats_.invalid_messages` and log the error with a truncated preview of the raw data. The session continues processing subsequent messages.
