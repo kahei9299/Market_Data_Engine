@@ -216,3 +216,85 @@ Documentation correctness is part of the milestone acceptance criteria.
 - Avoid duplicating content across documentation files.
 - Keep documentation synchronized with the latest implementation.
 - Treat documentation as part of production-quality engineering, not an afterthought.
+
+### 7. Code-Verified Learning Documentation
+
+`docs/LEARNING.md` must be treated as a technically accurate, code-verified learning resource, not an AI-generated summary.
+
+#### Requirements
+
+1. **Verify explanations against the actual codebase.**
+   - Inspect the relevant source files before documenting a concept.
+   - Ensure explanations accurately describe how the concept is implemented.
+   - Never assume a language feature, design pattern, or optimization is used without verifying it.
+
+2. **Use real code examples whenever possible.**
+   - Prefer short snippets extracted from the actual implementation.
+   - Reference the corresponding file, function, or class.
+   - Do not invent code examples and present them as existing project code.
+   - Clearly label hypothetical examples as illustrative.
+
+3. **Verify technical correctness.**
+   - Cross-check explanations against C++ language rules and relevant library documentation.
+   - Distinguish guaranteed behavior from implementation-specific behavior and assumptions.
+   - Avoid oversimplifications that introduce incorrect technical claims.
+   - Clearly state limitations, undefined behavior risks, and important edge cases.
+
+4. **Explain concepts in context.**
+   - Explain what the concept is.
+   - Identify where it appears in our project.
+   - Explain why we use it and what problem it solves.
+   - Discuss important tradeoffs, alternatives, and pitfalls.
+   - Include relevant code-review findings and lessons learned.
+
+5. **Prioritize understanding over documentation volume.**
+   - Focus on concepts genuinely encountered during implementation.
+   - Avoid generic textbook explanations unrelated to the codebase.
+   - Avoid documenting speculative optimizations as completed work.
+
+#### Mandatory Verification Before Every Commit
+
+Whenever `docs/LEARNING.md` is modified:
+
+1. Reinspect the referenced source files.
+2. Verify that code snippets match the implementation.
+3. Verify that technical claims are accurate.
+4. Check for contradictions with `README.md` and `docs/DECISIONS.md`.
+5. Correct outdated explanations when the implementation changes.
+6. Include a **Learning Documentation Verification** summary in the PR description.
+
+### 8. Source-Code Traceability
+
+Every technical concept documented in `docs/LEARNING.md` must be traceable to the actual source code.
+
+#### Requirements
+
+1. **Reference the implementation**
+   - Include the relevant source file and function, class, or method.
+   - Prefer clickable relative Markdown links to source files.
+   - Use line numbers only when useful, since they may become outdated after refactoring.
+   - Verify that referenced files, symbols, and links actually exist.
+
+2. **Use verified code snippets**
+   - Prefer code excerpts copied from the current implementation.
+   - Ensure snippets match the codebase at the time of writing.
+   - Clearly label simplified or hypothetical examples.
+   - Never present pseudocode as actual implementation.
+
+3. **Explain each concept in context**
+   - **What:** What is the C++ or systems concept?
+   - **Where:** Where is it implemented in the project?
+   - **Why:** Why was this approach chosen?
+   - **How:** How does the implementation work?
+   - **Pitfalls:** What could go wrong, and how does our code address it?
+
+4. **Maintain references during refactoring**
+   - Update source links and explanations when implementations change.
+   - Remove or revise examples that no longer match the code.
+   - Ensure learning documentation reflects the current codebase, while preserving significant historical lessons.
+
+5. **Verify before committing**
+   - Check that every referenced source file and symbol exists.
+   - Confirm that code snippets accurately represent the implementation.
+   - Identify hypothetical examples explicitly.
+   - Report any documentation that could not be verified.
