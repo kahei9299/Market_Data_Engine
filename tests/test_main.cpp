@@ -1,24 +1,25 @@
 #define BOOST_TEST_MODULE market_data_engine_tests
 #include <boost/test/unit_test.hpp>
 
+#include "depth_update.hpp"
 #include "session.hpp"
 #include "util.hpp"
-#include "validation.hpp"
 
 #include <boost/beast/core/flat_buffer.hpp>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <atomic>
+#include <cstdint>
+#include <limits>
 #include <regex>
 #include <string>
 
-// --- timestamp_now tests ---
+// --- timestamp_now tests (M1.1) ---
 
 BOOST_AUTO_TEST_SUITE(timestamp)
 
 BOOST_AUTO_TEST_CASE(format_matches_iso8601) {
     auto ts = timestamp_now();
-    // e.g. 2026-11-02T04:08:46.162Z
     std::regex pattern(R"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)");
     BOOST_TEST(std::regex_match(ts, pattern));
 }
@@ -30,9 +31,128 @@ BOOST_AUTO_TEST_CASE(length_is_24) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
-// --- validate_depth_message tests ---
+// --- scaled decimal parsing (M1.2) ---
 
-BOOST_AUTO_TEST_SUITE(validation)
+BOOST_AUTO_TEST_SUITE(scaled_decimal)
+
+BOOST_AUTO_TEST_CASE(integer_only) {
+    auto r = parse_scaled_decimal("12345");
+    BOOST_REQUIRE(std::holds_alternative<int64_t>(r));
+    BOOST_TEST(std::get<int64_t>(r) == 12345LL * kScaleFactor);
+}
+
+BOOST_AUTO_TEST_CASE(with_fractional) {
+    auto r = parse_scaled_decimal("78450.06000000");
+    BOOST_REQUIRE(std::holds_alternative<int64_t>(r));
+    BOOST_TEST(std::get<int64_t>(r) == 7845006000000LL);
+}
+
+BOOST_AUTO_TEST_CASE(short_fractional_padded) {
+    auto r = parse_scaled_decimal("1.5");
+    BOOST_REQUIRE(std::holds_alternative<int64_t>(r));
+    BOOST_TEST(std::get<int64_t>(r) == 150000000LL);
+}
+
+BOOST_AUTO_TEST_CASE(zero) {
+    auto r = parse_scaled_decimal("0");
+    BOOST_REQUIRE(std::holds_alternative<int64_t>(r));
+    BOOST_TEST(std::get<int64_t>(r) == 0LL);
+}
+
+BOOST_AUTO_TEST_CASE(zero_with_decimals) {
+    auto r = parse_scaled_decimal("0.00000000");
+    BOOST_REQUIRE(std::holds_alternative<int64_t>(r));
+    BOOST_TEST(std::get<int64_t>(r) == 0LL);
+}
+
+BOOST_AUTO_TEST_CASE(max_precision_8_digits) {
+    auto r = parse_scaled_decimal("0.12345678");
+    BOOST_REQUIRE(std::holds_alternative<int64_t>(r));
+    BOOST_TEST(std::get<int64_t>(r) == 12345678LL);
+}
+
+BOOST_AUTO_TEST_CASE(exceeds_precision) {
+    auto r = parse_scaled_decimal("0.123456789");
+    BOOST_REQUIRE(std::holds_alternative<ScaledParseError>(r));
+    BOOST_TEST(std::get<ScaledParseError>(r).message.find("decimal places") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(empty_input) {
+    auto r = parse_scaled_decimal("");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(trailing_dot) {
+    auto r = parse_scaled_decimal("123.");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(non_numeric) {
+    auto r = parse_scaled_decimal("abc");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(negative_rejected) {
+    auto r = parse_scaled_decimal("-1.0");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(negative_zero_rejected) {
+    auto r = parse_scaled_decimal("-0");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(negative_zero_decimal_rejected) {
+    auto r = parse_scaled_decimal("-0.00000000");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(overflow_large_integer) {
+    auto r = parse_scaled_decimal("99999999999999999");
+    BOOST_REQUIRE(std::holds_alternative<ScaledParseError>(r));
+    BOOST_TEST(std::get<ScaledParseError>(r).message.find("overflow") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(boundary_max_safe_integer) {
+    // max int64 / 10^8 = 92233720368
+    auto r = parse_scaled_decimal("92233720368.0");
+    BOOST_REQUIRE(std::holds_alternative<int64_t>(r));
+    BOOST_TEST(std::get<int64_t>(r) == 92233720368LL * kScaleFactor);
+}
+
+BOOST_AUTO_TEST_CASE(boundary_just_over_max) {
+    auto r = parse_scaled_decimal("92233720369.0");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(exact_int64_max) {
+    // INT64_MAX = 9223372036854775807 = 92233720368.54775807 at scale 10^8
+    auto r = parse_scaled_decimal("92233720368.54775807");
+    BOOST_REQUIRE(std::holds_alternative<int64_t>(r));
+    BOOST_TEST(std::get<int64_t>(r) == std::numeric_limits<int64_t>::max());
+}
+
+BOOST_AUTO_TEST_CASE(one_past_int64_max) {
+    // 92233720368.54775808 = INT64_MAX + 1 — must be rejected
+    auto r = parse_scaled_decimal("92233720368.54775808");
+    BOOST_REQUIRE(std::holds_alternative<ScaledParseError>(r));
+    BOOST_TEST(std::get<ScaledParseError>(r).message.find("overflow") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(max_integer_with_large_frac_overflows) {
+    // 92233720368.99999999 — integer part fits but frac causes overflow
+    auto r = parse_scaled_decimal("92233720368.99999999");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// --- depth update parsing (M1.2) ---
+
+BOOST_AUTO_TEST_SUITE(depth_update_parsing)
 
 static const std::string kValidMessage = R"({
     "e": "depthUpdate",
@@ -44,87 +164,259 @@ static const std::string kValidMessage = R"({
     "a": [["78450.07000000","2.27294000"]]
 })";
 
-BOOST_AUTO_TEST_CASE(valid_message) {
-    auto r = validate_depth_message(kValidMessage);
-    BOOST_TEST(r.ok);
-    BOOST_TEST(r.error.empty());
+BOOST_AUTO_TEST_CASE(valid_message_parses) {
+    auto r = parse_depth_update(kValidMessage);
+    BOOST_REQUIRE(std::holds_alternative<DepthUpdate>(r));
+    auto const& u = std::get<DepthUpdate>(r);
+    BOOST_TEST(u.symbol == "BTCUSDT");
+    BOOST_TEST(u.event_time == 1793587539014ULL);
+    BOOST_TEST(u.first_update_id == 102171391360ULL);
+    BOOST_TEST(u.last_update_id == 102171391511ULL);
+    BOOST_TEST(u.bids.size() == 1u);
+    BOOST_TEST(u.asks.size() == 1u);
+    BOOST_TEST(u.bids[0].price == 7845006000000LL);
+    BOOST_TEST(u.bids[0].quantity == 4581000LL);
+    BOOST_TEST(u.asks[0].price == 7845007000000LL);
+    BOOST_TEST(u.asks[0].quantity == 227294000LL);
+}
+
+BOOST_AUTO_TEST_CASE(empty_bid_ask_arrays) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "BTCUSDT",
+        "U": 1, "u": 2, "b": [], "a": []
+    })");
+    BOOST_REQUIRE(std::holds_alternative<DepthUpdate>(r));
+    auto const& u = std::get<DepthUpdate>(r);
+    BOOST_TEST(u.bids.empty());
+    BOOST_TEST(u.asks.empty());
+}
+
+BOOST_AUTO_TEST_CASE(multiple_price_levels) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "BTCUSDT",
+        "U": 1, "u": 5,
+        "b": [["100.00000000","1.00000000"],["99.50000000","2.50000000"]],
+        "a": [["101.00000000","0.50000000"],["101.50000000","3.00000000"],["102.00000000","1.00000000"]]
+    })");
+    BOOST_REQUIRE(std::holds_alternative<DepthUpdate>(r));
+    auto const& u = std::get<DepthUpdate>(r);
+    BOOST_TEST(u.bids.size() == 2u);
+    BOOST_TEST(u.asks.size() == 3u);
+    BOOST_TEST(u.bids[1].price == 9950000000LL);
+    BOOST_TEST(u.bids[1].quantity == 250000000LL);
+}
+
+BOOST_AUTO_TEST_CASE(zero_quantity_deletion) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "BTCUSDT",
+        "U": 1, "u": 1,
+        "b": [["78450.06000000","0.00000000"]], "a": []
+    })");
+    BOOST_REQUIRE(std::holds_alternative<DepthUpdate>(r));
+    auto const& u = std::get<DepthUpdate>(r);
+    BOOST_TEST(u.bids[0].quantity == 0LL);
 }
 
 BOOST_AUTO_TEST_CASE(invalid_json) {
-    auto r = validate_depth_message("not json at all");
-    BOOST_TEST(!r.ok);
-    BOOST_TEST(r.error.find("invalid JSON") != std::string::npos);
+    auto r = parse_depth_update("not json");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("invalid JSON") !=
+               std::string::npos);
 }
 
-BOOST_AUTO_TEST_CASE(empty_input) {
-    auto r = validate_depth_message("");
-    BOOST_TEST(!r.ok);
-}
-
-BOOST_AUTO_TEST_CASE(json_array_not_object) {
-    auto r = validate_depth_message("[1, 2, 3]");
-    BOOST_TEST(!r.ok);
-    BOOST_TEST(r.error.find("expected JSON object") != std::string::npos);
+BOOST_AUTO_TEST_CASE(not_an_object) {
+    auto r = parse_depth_update("[1, 2, 3]");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
 }
 
 BOOST_AUTO_TEST_CASE(missing_event_type) {
-    auto r = validate_depth_message(R"({
-        "E": 123, "U": 1, "u": 2, "b": [], "a": []
+    auto r = parse_depth_update(R"({
+        "E": 100, "s": "X", "U": 1, "u": 2, "b": [], "a": []
     })");
-    BOOST_TEST(!r.ok);
-    BOOST_TEST(r.error.find("\"e\"") != std::string::npos);
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("\"e\"") !=
+               std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(wrong_event_type) {
-    auto r = validate_depth_message(R"({
-        "e": "trade", "E": 123, "U": 1, "u": 2, "b": [], "a": []
+    auto r = parse_depth_update(R"({
+        "e": "trade", "E": 100, "s": "X", "U": 1, "u": 2, "b": [], "a": []
     })");
-    BOOST_TEST(!r.ok);
-    BOOST_TEST(r.error.find("unexpected event type") != std::string::npos);
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("unexpected event type") !=
+               std::string::npos);
 }
 
-BOOST_AUTO_TEST_CASE(missing_numeric_field_U) {
-    auto r = validate_depth_message(R"({
-        "e": "depthUpdate", "E": 123, "u": 2, "b": [], "a": []
+BOOST_AUTO_TEST_CASE(missing_symbol) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "U": 1, "u": 2, "b": [], "a": []
     })");
-    BOOST_TEST(!r.ok);
-    BOOST_TEST(r.error.find("\"U\"") != std::string::npos);
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(missing_timestamp) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "s": "X", "U": 1, "u": 2, "b": [], "a": []
+    })");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(missing_first_update_id) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X", "u": 2, "b": [], "a": []
+    })");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(invalid_sequence_range_U_greater_than_u) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 10, "u": 5, "b": [], "a": []
+    })");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("sequence range") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(U_equals_u_is_valid) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 5, "u": 5, "b": [], "a": []
+    })");
+    BOOST_TEST(std::holds_alternative<DepthUpdate>(r));
+}
+
+BOOST_AUTO_TEST_CASE(price_level_not_array) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1, "b": ["wrong"], "a": []
+    })");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(price_level_wrong_element_count) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1, "b": [["100.0","1.0","extra"]], "a": []
+    })");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("2 elements") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(price_level_numeric_not_string) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1, "b": [[100.0, 1.0]], "a": []
+    })");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("strings") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(malformed_price_string) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1, "b": [["abc","1.0"]], "a": []
+    })");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("price") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(malformed_quantity_string) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1, "b": [["100.0","xyz"]], "a": []
+    })");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("quantity") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(zero_price_rejected) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1, "b": [["0.00000000","1.0"]], "a": []
+    })");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("positive") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(negative_quantity_rejected) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1, "b": [["100.0","-1.0"]], "a": []
+    })");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(excessive_decimal_precision_rejected) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1, "b": [["100.123456789","1.0"]], "a": []
+    })");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(overflow_price_rejected) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1, "b": [["99999999999999999.0","1.0"]], "a": []
+    })");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(atomic_failure_no_partial_result) {
+    // Invalid ask array should not produce a DepthUpdate with valid bids.
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "BTCUSDT",
+        "U": 1, "u": 1,
+        "b": [["100.0","1.0"]],
+        "a": [["bad","1.0"]]
+    })");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
 }
 
 BOOST_AUTO_TEST_CASE(missing_bids_array) {
-    auto r = validate_depth_message(R"({
-        "e": "depthUpdate", "E": 123, "U": 1, "u": 2, "a": []
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X", "U": 1, "u": 2, "a": []
     })");
-    BOOST_TEST(!r.ok);
-    BOOST_TEST(r.error.find("\"b\"") != std::string::npos);
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
 }
 
 BOOST_AUTO_TEST_CASE(missing_asks_array) {
-    auto r = validate_depth_message(R"({
-        "e": "depthUpdate", "E": 123, "U": 1, "u": 2, "b": []
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X", "U": 1, "u": 2, "b": []
     })");
-    BOOST_TEST(!r.ok);
-    BOOST_TEST(r.error.find("\"a\"") != std::string::npos);
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
 }
 
-BOOST_AUTO_TEST_CASE(bids_not_array) {
-    auto r = validate_depth_message(R"({
-        "e": "depthUpdate", "E": 123, "U": 1, "u": 2, "b": "wrong", "a": []
+BOOST_AUTO_TEST_CASE(empty_symbol_rejected) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "",
+        "U": 1, "u": 1, "b": [], "a": []
     })");
-    BOOST_TEST(!r.ok);
-    BOOST_TEST(r.error.find("\"b\"") != std::string::npos);
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("empty symbol") !=
+               std::string::npos);
 }
 
-BOOST_AUTO_TEST_CASE(empty_arrays_are_valid) {
-    auto r = validate_depth_message(R"({
-        "e": "depthUpdate", "E": 123, "s": "BTCUSDT", "U": 1, "u": 2, "b": [], "a": []
+BOOST_AUTO_TEST_CASE(fractional_overflow_through_parser) {
+    // 92233720368.54775808 overflows INT64_MAX via the fractional part.
+    // Must be caught as a parse error, not undefined behavior.
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1,
+        "b": [["92233720368.54775808","1.0"]], "a": []
     })");
-    BOOST_TEST(r.ok);
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
 
-// --- bounded buffer test ---
+// --- bounded buffer test (M1.1) ---
 
 BOOST_AUTO_TEST_SUITE(buffer)
 
@@ -135,7 +427,7 @@ BOOST_AUTO_TEST_CASE(flat_buffer_respects_max_size) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
-// --- TLS hostname verification ---
+// --- TLS hostname verification (M1.1) ---
 
 BOOST_AUTO_TEST_SUITE(tls)
 
@@ -147,18 +439,12 @@ BOOST_AUTO_TEST_CASE(ssl_set1_host_configures_verification) {
     BOOST_TEST(SSL_set_tlsext_host_name(handle, "example.com") == 1);
     BOOST_TEST(SSL_set1_host(handle, "example.com") == 1);
 
-    // Confirm the verification parameter object exists and is configured.
     X509_VERIFY_PARAM* param = SSL_get0_param(handle);
     BOOST_REQUIRE(param != nullptr);
-
-    // SSL_set1_host registers the hostname for verification — OpenSSL will
-    // check the cert's SAN/CN during handshake. The hostname_mismatch test
-    // below proves this rejects actual mismatches end-to-end.
 
     SSL_free(handle);
 }
 
-// Self-signed cert for "testserver.local" — used only in tests.
 static constexpr char kTestCert[] = R"(-----BEGIN CERTIFICATE-----
 MIIDNDCCAhygAwIBAgIUM5Nzg/6ZexgbDDGoVaabU8j6oHEwDQYJKoZIhvcNAQEL
 BQAwGzEZMBcGA1UEAwwQdGVzdHNlcnZlci5sb2NhbDAeFw0yNjExMDMwNTU5NDda
@@ -210,20 +496,14 @@ xEpps7lFh3NB14EIreRcOkoYQkP8Wx0JvsaF7ckii/dGvL9nLCpxBLQqRIGgWl6p
 -----END PRIVATE KEY-----)";
 
 BOOST_AUTO_TEST_CASE(hostname_mismatch_rejected_by_local_server) {
-    // Local TLS server with cert for "testserver.local".
-    // Session connects to "localhost" — SSL_set1_host("localhost") won't
-    // match the cert's SAN "testserver.local", so the handshake must fail.
-
     net::io_context ioc;
 
-    // Server context: load the test cert/key.
     ssl::context server_ctx(ssl::context::tlsv12_server);
     server_ctx.use_certificate_chain(
         net::buffer(kTestCert, std::strlen(kTestCert)));
     server_ctx.use_private_key(
         net::buffer(kTestKey, std::strlen(kTestKey)), ssl::context::pem);
 
-    // Bind to an ephemeral port on localhost.
     beast::error_code bind_ec;
     tcp::acceptor acceptor(ioc);
     acceptor.open(tcp::v4(), bind_ec);
@@ -243,7 +523,6 @@ BOOST_AUTO_TEST_CASE(hostname_mismatch_rejected_by_local_server) {
     }
     auto port = std::to_string(acceptor.local_endpoint().port());
 
-    // Accept one connection and attempt server-side TLS handshake.
     ssl::stream<tcp::socket> server_stream(ioc, server_ctx);
     acceptor.async_accept(server_stream.next_layer(),
         [&server_stream](beast::error_code ec) {
@@ -253,13 +532,11 @@ BOOST_AUTO_TEST_CASE(hostname_mismatch_rejected_by_local_server) {
             }
         });
 
-    // Client context: trust our self-signed cert's CA.
     ssl::context client_ctx(ssl::context::tlsv12_client);
     client_ctx.add_certificate_authority(
         net::buffer(kTestCert, std::strlen(kTestCert)));
     client_ctx.set_verify_mode(ssl::verify_peer);
 
-    // Connect as "localhost" — cert says "testserver.local" → mismatch.
     std::atomic<bool> error_fired{false};
     std::string error_stage;
     auto session = std::make_shared<Session>(
@@ -278,7 +555,7 @@ BOOST_AUTO_TEST_CASE(hostname_mismatch_rejected_by_local_server) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
-// --- Session lifecycle tests ---
+// --- Session lifecycle tests (M1.1) ---
 
 BOOST_AUTO_TEST_SUITE(session_lifecycle)
 
@@ -297,7 +574,6 @@ BOOST_AUTO_TEST_CASE(stop_during_resolve_does_not_advance) {
     session->stop();
     ioc.run();
 
-    // Connection must not have advanced — stats show never connected.
     auto const& stats = session->stats();
     BOOST_TEST(stats.messages_received == 0u);
     BOOST_TEST(

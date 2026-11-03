@@ -298,3 +298,55 @@ Every technical concept documented in `docs/LEARNING.md` must be traceable to th
    - Confirm that code snippets accurately represent the implementation.
    - Identify hypothetical examples explicitly.
    - Report any documentation that could not be verified.
+
+## Readability, Simplicity & Ponytail Review
+
+Write the simplest correct, readable, production-appropriate C++20 code that satisfies the agreed milestone requirements.
+
+### Code quality principles
+
+- Prioritize readability, clarity, and maintainability over cleverness.
+- Prefer straightforward control flow and descriptive variable names.
+- Use existing C++ standard library facilities and project components wherever possible.
+- Avoid unnecessary classes, wrappers, abstractions, helper functions, dependencies, and configuration.
+- Follow YAGNI: do not implement functionality for hypothetical future requirements.
+- Avoid duplicating existing logic.
+- Do not introduce concurrency, custom memory management, or optimizations without demonstrated need.
+- Prefer small, cohesive functions with clear responsibilities.
+- Keep comments focused on explaining why, not restating what obvious code does.
+- Do not sacrifice readability merely to minimize line count.
+
+### Mandatory Ponytail review
+
+After implementing meaningful code changes and before requesting PR review:
+
+1. Run the installed `/ponytail-review` command against the relevant changes.
+2. Identify unnecessary complexity, abstractions, dependencies, and duplicated logic.
+3. Simplify the implementation where doing so improves readability or maintainability.
+4. Verify that simplification preserves behavior and correctness.
+5. Run relevant tests again after changes.
+6. Summarize what was simplified and why.
+
+Use `/ponytail-audit` for broader codebase reviews when appropriate, rather than for every small change.
+
+If Ponytail is unavailable, explicitly report this and perform a manual simplicity review instead.
+
+### Non-negotiable constraints
+
+Never simplify away:
+- Error handling and input validation
+- Memory and resource safety
+- Concurrency and synchronization guarantees
+- Market-data sequencing and correctness
+- Necessary tests and regression coverage
+- Production reliability and operational diagnostics
+
+When additional complexity is necessary, explain the concrete requirement that justifies it.
+
+### Learning objective
+
+Generated code must be understandable to a computer science student learning production C++ systems engineering.
+
+I should be able to explain the purpose, control flow, memory ownership, and important design choices without having to reverse-engineer unnecessary abstractions.
+
+Prefer understandable engineering over impressive-looking engineering.
