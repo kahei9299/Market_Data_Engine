@@ -56,6 +56,8 @@ void Session::on_resolve(beast::error_code ec,
                          tcp::resolver::results_type results) {
     if (ec)
         return fail(ec, "resolve");
+    if (stopping_)
+        return;
 
     beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(10));
 
@@ -68,6 +70,8 @@ void Session::on_connect(beast::error_code ec,
                          tcp::resolver::results_type::endpoint_type) {
     if (ec)
         return fail(ec, "connect");
+    if (stopping_)
+        return;
 
     auto& ssl_stream = ws_.next_layer();
 
@@ -99,6 +103,8 @@ void Session::on_connect(beast::error_code ec,
 void Session::on_ssl_handshake(beast::error_code ec) {
     if (ec)
         return fail(ec, "ssl_handshake");
+    if (stopping_)
+        return;
 
     // Disable the tcp_stream timeout — Beast's WebSocket layer manages
     // its own idle timeout and ping/pong handling.
@@ -120,6 +126,8 @@ void Session::on_ssl_handshake(beast::error_code ec) {
 void Session::on_handshake(beast::error_code ec) {
     if (ec)
         return fail(ec, "handshake");
+    if (stopping_)
+        return;
 
     stats_.connected_at = std::chrono::steady_clock::now();
     std::cerr << "connected to " << host_ << path_ << '\n';
@@ -127,6 +135,8 @@ void Session::on_handshake(beast::error_code ec) {
 }
 
 void Session::do_read() {
+    if (stopping_)
+        return;
     ws_.async_read(
         buffer_,
         beast::bind_front_handler(&Session::on_read, shared_from_this()));
@@ -135,6 +145,8 @@ void Session::do_read() {
 void Session::on_read(beast::error_code ec, std::size_t bytes_transferred) {
     if (ec)
         return fail(ec, "read");
+    if (stopping_)
+        return;
 
     auto data = beast::buffers_to_string(buffer_.data());
 
