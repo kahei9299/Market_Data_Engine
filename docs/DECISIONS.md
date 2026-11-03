@@ -30,7 +30,7 @@ Using the production endpoint, not testnet. Read-only with a single connection â
 
 ### Output: timestamp + raw JSON
 
-Each message prints as `[ISO-8601-UTC] <raw JSON>` on one line. The timestamp is local receive time. Comparing it with Binance's `E` field (event time) reveals network latency.
+Each message prints as `[ISO-8601-UTC] <raw JSON>` on one line. The timestamp is local receive time. Comparing it with Binance's `E` field (exchange event time) gives an approximate measure of message freshness â€” not isolated network latency, since it includes exchange-side queuing, serialization, and clock skew between the exchange and the local machine.
 
 ### Session class for async lifetime safety
 
@@ -38,7 +38,7 @@ A `Session` class using `std::enable_shared_from_this` owns the connection objec
 
 ### TLS: certificate validation and hostname verification
 
-SSL context uses `set_default_verify_paths()` (system CA roots) and `verify_peer`. `SSL_set_tlsext_host_name` enables SNI and hostname verification. Beast's WebSocket timeout handles ping/pong automatically via `timeout::suggested(role_type::client)`.
+SSL context uses `set_default_verify_paths()` (system CA roots) and `verify_peer` (reject untrusted certificates). Two separate OpenSSL calls handle hostname security: `SSL_set_tlsext_host_name` sets SNI (tells the server which certificate to present), and `SSL_set1_host` configures certificate hostname verification (OpenSSL checks the certificate's SAN/CN matches the expected hostname during handshake). Beast's WebSocket timeout handles ping/pong automatically via `timeout::suggested(role_type::client)`.
 
 ### Build: CMake + Ninja, C++20
 

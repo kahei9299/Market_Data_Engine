@@ -22,25 +22,30 @@ int main() {
         ctx.set_default_verify_paths();
         ctx.set_verify_mode(ssl::verify_peer);
 
+        // Declared before session so the error callback can capture it.
+        net::signal_set signals(ioc, SIGINT, SIGTERM);
+        int exit_code = EXIT_SUCCESS;
+
         auto session = std::make_shared<Session>(
             ioc, ctx, kHost, kPort, kPath,
-            [](beast::error_code ec, char const* what) {
-                std::cerr << "fatal: " << what << ": " << ec.message() << '\n';
+            [&signals, &exit_code](beast::error_code, char const*) {
+                exit_code = EXIT_FAILURE;
+                signals.cancel();
             });
         session->run();
 
-        // Ctrl-C triggers a clean WebSocket close instead of a raw kill.
-        net::signal_set signals(ioc, SIGINT, SIGTERM);
-        signals.async_wait([&session](beast::error_code, int sig) {
+        signals.async_wait([&session](beast::error_code ec, int sig) {
+            if (ec)
+                return; // cancelled by error callback
             std::cerr << "\nreceived signal " << sig << ", shutting down...\n";
             session->stop();
         });
 
         ioc.run();
+        return exit_code;
 
     } catch (std::exception const& e) {
         std::cerr << "fatal: " << e.what() << '\n';
         return EXIT_FAILURE;
     }
-    return EXIT_SUCCESS;
 }

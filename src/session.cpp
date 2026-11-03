@@ -28,10 +28,19 @@ void Session::stop() {
         return;
     stopping_ = true;
     print_stats();
+
+    resolver_.cancel();
+
     if (ws_.is_open()) {
+        // WebSocket established — send a clean Close frame.
         ws_.async_close(
             websocket::close_code::normal,
             beast::bind_front_handler(&Session::on_close, shared_from_this()));
+    } else {
+        // Still in DNS/TCP/TLS/WS handshake — close the underlying socket.
+        // Pending async operations get operation_aborted, which fail() suppresses.
+        beast::error_code ec;
+        beast::get_lowest_layer(ws_).socket().close(ec);
     }
 }
 
@@ -62,11 +71,21 @@ void Session::on_connect(beast::error_code ec,
 
     auto& ssl_stream = ws_.next_layer();
 
-    // TLS hostname verification: the server's certificate must match host_.
+    // SNI: tell the server which hostname we want (for multi-domain hosts).
     if (!SSL_set_tlsext_host_name(ssl_stream.native_handle(), host_.c_str())) {
         ec = beast::error_code(static_cast<int>(::ERR_get_error()),
                                net::error::get_ssl_category());
         return fail(ec, "ssl_set_host_name");
+    }
+
+    // Certificate hostname verification: OpenSSL checks the certificate's
+    // SAN/CN against this hostname during the handshake. Without this,
+    // verify_peer only checks the CA chain, not whether the cert belongs
+    // to the host we intended to connect to.
+    if (!SSL_set1_host(ssl_stream.native_handle(), host_.c_str())) {
+        ec = beast::error_code(static_cast<int>(::ERR_get_error()),
+                               net::error::get_ssl_category());
+        return fail(ec, "ssl_set1_host");
     }
 
     beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(10));
@@ -142,13 +161,18 @@ void Session::on_close(beast::error_code ec) {
 }
 
 void Session::print_stats() {
-    auto elapsed = std::chrono::steady_clock::now() - stats_.connected_at;
-    auto secs =
-        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+    std::cerr << "--- session stats ---\n";
 
-    std::cerr << "--- session stats ---\n"
-              << "  uptime:           " << secs << "s\n"
-              << "  messages:         " << stats_.messages_received << '\n'
+    if (stats_.connected_at == std::chrono::steady_clock::time_point{}) {
+        std::cerr << "  status:           never connected\n";
+    } else {
+        auto elapsed = std::chrono::steady_clock::now() - stats_.connected_at;
+        auto secs =
+            std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+        std::cerr << "  uptime:           " << secs << "s\n";
+    }
+
+    std::cerr << "  messages:         " << stats_.messages_received << '\n'
               << "  bytes:            " << stats_.bytes_received << '\n'
               << "  invalid messages: " << stats_.invalid_messages << '\n';
 }
