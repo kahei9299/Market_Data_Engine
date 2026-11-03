@@ -7,10 +7,6 @@ namespace json = boost::json;
 
 namespace {
 
-ParseResult make_error(std::string msg) {
-    return ParseError{std::move(msg)};
-}
-
 // Extract a required uint64 field from a JSON object.
 std::variant<uint64_t, ParseError>
 get_uint64(json::object const& obj, char const* key) {
@@ -90,27 +86,27 @@ ParseResult parse_depth_update(std::string_view data) {
     boost::system::error_code ec;
     auto jv = json::parse(data, ec);
     if (ec)
-        return make_error("invalid JSON: " + ec.message());
+        return ParseError{"invalid JSON: " + ec.message()};
 
     if (!jv.is_object())
-        return make_error("expected JSON object");
+        return ParseError{"expected JSON object"};
 
     auto const& obj = jv.get_object();
 
     // Event type.
     auto e_it = obj.find("e");
     if (e_it == obj.end() || !e_it->value().is_string())
-        return make_error("missing or non-string field \"e\"");
+        return ParseError{"missing or non-string field \"e\""};
     if (e_it->value().get_string() != "depthUpdate")
-        return make_error("unexpected event type: " +
-                          std::string(e_it->value().get_string()));
+        return ParseError{"unexpected event type: " +
+                          std::string(e_it->value().get_string())};
 
     // Symbol.
     auto s_it = obj.find("s");
     if (s_it == obj.end() || !s_it->value().is_string())
-        return make_error("missing or non-string field \"s\"");
+        return ParseError{"missing or non-string field \"s\""};
     if (s_it->value().get_string().empty())
-        return make_error("empty symbol");
+        return ParseError{"empty symbol"};
 
     // Timestamps and sequence IDs.
     auto event_time = get_uint64(obj, "E");
@@ -128,13 +124,13 @@ ParseResult parse_depth_update(std::string_view data) {
     auto U = std::get<uint64_t>(first_id);
     auto u = std::get<uint64_t>(last_id);
     if (U > u)
-        return make_error("invalid sequence range: U(" + std::to_string(U) +
-                          ") > u(" + std::to_string(u) + ")");
+        return ParseError{"invalid sequence range: U(" + std::to_string(U) +
+                          ") > u(" + std::to_string(u) + ")"};
 
     // Bids.
     auto b_it = obj.find("b");
     if (b_it == obj.end() || !b_it->value().is_array())
-        return make_error("missing or non-array field \"b\"");
+        return ParseError{"missing or non-array field \"b\""};
 
     auto bids = parse_levels(b_it->value().get_array(), "bids");
     if (auto* err = std::get_if<ParseError>(&bids))
@@ -143,7 +139,7 @@ ParseResult parse_depth_update(std::string_view data) {
     // Asks.
     auto a_it = obj.find("a");
     if (a_it == obj.end() || !a_it->value().is_array())
-        return make_error("missing or non-array field \"a\"");
+        return ParseError{"missing or non-array field \"a\""};
 
     auto asks = parse_levels(a_it->value().get_array(), "asks");
     if (auto* err = std::get_if<ParseError>(&asks))
