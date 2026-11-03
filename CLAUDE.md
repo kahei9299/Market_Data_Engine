@@ -120,3 +120,99 @@ Include:
 - Do not merge with unresolved P0 or P1 issues.
 
 The objective is production-quality, reviewable, incrementally developed C++ software.
+
+## Documentation & Knowledge Management
+
+Documentation is a mandatory part of the development workflow. The project must maintain three complementary documents:
+
+### 1. `README.md` — Project Documentation
+
+**Purpose:** Explain what the project does, how it works, and how to use it.
+
+Keep the README updated with:
+
+- Project overview and current development status
+- Completed, ongoing, and planned milestones
+- Technology stack and dependencies
+- Project directory structure
+- Architecture overview and component responsibilities
+- Data flow between implemented components
+- Build, test, and execution instructions
+- Current features, limitations, and known issues
+- Performance measurements, when available and verified
+
+Explain how components interact using concise technical descriptions and diagrams where useful.
+
+The README must always represent the **actual implemented state** of the project, not planned functionality presented as completed.
+
+### 2. `docs/DECISIONS.md` — Engineering Decision Log
+
+**Purpose:** Record why important technical decisions were made.
+
+For each significant architectural or implementation decision, document:
+
+- The problem or requirement
+- Options considered
+- Selected approach
+- Reasoning and tradeoffs
+- Alternatives rejected and why
+- Performance, correctness, or reliability implications
+- Conditions that would justify revisiting the decision
+
+Do not document trivial implementation details or create unnecessary entries.
+
+Preserve historical decisions. If a decision changes, mark it as superseded and explain why rather than silently rewriting history.
+
+### 3. `docs/LEARNING.md` — C++ & Systems Engineering Learning Journal
+
+**Purpose:** Help me understand the codebase and develop the technical knowledge needed to build and maintain it independently.
+
+For every milestone, document:
+
+- Important C++ language features introduced
+- Relevant systems programming concepts
+- Networking, memory management, concurrency, and performance concepts
+- How these concepts are used in the actual implementation
+- Important bugs encountered and their root causes
+- Lessons learned during code reviews
+- Common pitfalls and how to avoid them
+
+Use small, relevant code snippets from the project to illustrate concepts when useful.
+
+Prioritize understanding **why the code works**, not merely describing what each line does.
+
+Do not turn this into a generic C++ textbook. Focus on concepts directly encountered in the project.
+
+### 4. Mandatory Documentation Workflow
+
+Before every meaningful code commit:
+
+1. Review the code changes.
+2. Update `README.md` if implementation, behavior, architecture, dependencies, or usage changed.
+3. Update `docs/DECISIONS.md` if important engineering decisions were introduced or revised.
+4. Update `docs/LEARNING.md` with meaningful concepts, debugging insights, or lessons encountered.
+5. Ensure all documentation accurately reflects the resulting code.
+6. Include relevant documentation updates in the same commit as the code changes.
+
+Do not create artificial documentation changes for trivial modifications.
+
+### 5. Pull Request Requirements
+
+Every milestone PR must contain a **Documentation Summary** explaining:
+
+- Which documentation files were updated
+- What technical decisions were recorded
+- What learning concepts were added
+- Whether any documentation remains incomplete
+
+Documentation correctness is part of the milestone acceptance criteria.
+
+### 6. Documentation Quality Standards
+
+- Prefer clear, concise, technically accurate explanations.
+- Reference actual project classes, functions, and files.
+- Never claim unimplemented functionality is complete.
+- Never invent benchmark results or test outcomes.
+- Avoid duplicating content across documentation files.
+- Keep documentation synchronized with the latest implementation.
+- Treat documentation as part of production-quality engineering, not an afterthought.
