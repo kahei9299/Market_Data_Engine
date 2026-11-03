@@ -76,21 +76,27 @@ The initial implementation only called `SSL_set_tlsext_host_name`, which configu
 
 **Learned during code review — a subtle concurrency issue even in single-threaded code.**
 
-`stop()` cancels the resolver and closes the socket. Pending operations get `operation_aborted`. But an operation that already completed successfully before `stop()` ran isn't cancelled — its callback fires with no error and would start the next connection stage on a closed socket.
+`stop()` cancels the resolver and closes the socket. Cancellation is a **request**, not a guarantee. It has three possible outcomes for each pending operation:
 
-**Fix:** Every callback checks `if (stopping_) return;` after the error check. This covers the race where an operation completes successfully between `stop()` setting `stopping_ = true` and the cancellation taking effect.
+1. **The operation hasn't started yet** — it completes with `operation_aborted`.
+2. **The operation is in progress** — closing the socket interrupts it; the callback fires with an error (which may or may not be `operation_aborted` — the specific error depends on the OS and the operation's state).
+3. **The operation already completed successfully** — cancellation has no effect. The callback fires with no error and, without a guard, would proceed to start the next connection stage.
+
+Case 3 is the dangerous one. It's a race: the resolve completes, its successful result is queued for dispatch, and then `stop()` runs. The callback will see `ec` with no error and happily call `async_connect` — potentially on a socket that `stop()` already closed.
+
+**Fix:** Every callback checks `if (stopping_) return;` after the error check.
 
 ```cpp
 void Session::on_resolve(beast::error_code ec, tcp::resolver::results_type results) {
     if (ec)
-        return fail(ec, "resolve");   // handles cancellation
+        return fail(ec, "resolve");   // may be operation_aborted or another error
     if (stopping_)
-        return;                        // handles race: resolved before cancel
+        return;                        // completed successfully, but we're shutting down
     // ... proceed with connect
 }
 ```
 
-**Why this matters:** In async code, "cancel" doesn't mean "guaranteed not to run." It means "the next I/O operation will see the cancellation." Any already-completed operation must check the shutdown flag explicitly.
+**Key insight:** In async code, cancellation means "try to stop pending work." It does not guarantee any particular error code, and it cannot recall a callback that's already queued for dispatch. Explicit state checks (`stopping_`) are the only reliable way to prevent post-shutdown operations.
 
 ### `error_code` vs. exceptions
 
@@ -114,19 +120,24 @@ Session::Session(..., std::string host, ...)
     : host_(std::move(host)) {}
 ```
 
-The constructor takes `host` **by value**. The caller either copies (if they keep their string) or moves (if they don't). Inside the constructor, `std::move` transfers the string's heap memory into the member without copying. After the move, the parameter `host` is empty.
+The constructor takes `host` **by value**. The caller either copies (if they keep their string) or moves (if they don't). Inside the constructor, `std::move` casts `host` to an rvalue reference, enabling the move constructor of `host_` to steal the source's resources instead of copying. For heap-allocated strings, this transfers the internal buffer pointer. For short strings (typically ≤ 22 bytes), implementations use Small String Optimization (SSO) and store the characters inline — a "move" of a short string is actually a copy since there's no heap allocation to transfer.
+
+After the move, `host` is in a **valid but unspecified** state. The standard does not guarantee it's empty — only that it can be safely destroyed or assigned to. Don't read a moved-from object.
 
 This "take by value, then move" idiom gives the caller the choice of copy or move, with at most one copy total.
 
 ### Anonymous namespaces for file-private functions
 
+When a helper function is only needed within a single `.cpp` file, an anonymous namespace restricts its visibility to that translation unit:
+
 ```cpp
+// In some_file.cpp — not visible to any other .cpp file:
 namespace {
-std::string timestamp_now() { ... }
+int internal_helper() { return 42; }
 }
 ```
 
-An unnamed namespace makes the function visible only within its translation unit (`.cpp` file). It's the C++ equivalent of `static` for free functions. Other `.cpp` files can't call or collide with it.
+This is the C++ equivalent of `static` for free functions. Other translation units can't call or collide with it. In our project, `timestamp_now()` was originally in an anonymous namespace inside `session.cpp` before being promoted to a shared function in `util.hpp` so tests could use it. The technique applies whenever a function is an implementation detail of a single file.
 
 ### `std::chrono` time handling
 
