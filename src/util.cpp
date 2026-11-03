@@ -25,6 +25,11 @@ ScaledResult parse_scaled_decimal(std::string_view s) {
     if (s.empty())
         return ScaledParseError{"empty input"};
 
+    // Reject negative values including "-0" — from_chars parses "-0" as 0,
+    // which would bypass the integer < 0 check.
+    if (s[0] == '-')
+        return ScaledParseError{"negative value"};
+
     auto dot = s.find('.');
     std::string_view int_part;
     std::string_view frac_part;
@@ -54,9 +59,6 @@ ScaledResult parse_scaled_decimal(std::string_view s) {
     if (ec1 != std::errc{} || p1 != int_part.data() + int_part.size())
         return ScaledParseError{"invalid integer part"};
 
-    if (integer < 0)
-        return ScaledParseError{"negative value"};
-
     // Check overflow before scaling: integer * kScaleFactor must fit int64_t.
     static constexpr int64_t kMaxInteger =
         std::numeric_limits<int64_t>::max() / kScaleFactor;
@@ -74,14 +76,15 @@ ScaledResult parse_scaled_decimal(std::string_view s) {
         if (ec2 != std::errc{} || p2 != frac_part.data() + frac_part.size())
             return ScaledParseError{"invalid fractional part"};
 
-        if (frac < 0)
-            return ScaledParseError{"negative fractional part"};
-
         // Scale fractional part up to kDecimalScale digits.
         // e.g. frac="06" with kDecimalScale=8 → 06 * 10^6 = 6000000
         int missing_digits = kDecimalScale - static_cast<int>(frac_part.size());
         for (int i = 0; i < missing_digits; ++i)
             frac *= 10;
+
+        // Check overflow before fractional addition.
+        if (frac > std::numeric_limits<int64_t>::max() - result)
+            return ScaledParseError{"overflows scaled representation"};
 
         result += frac;
     }

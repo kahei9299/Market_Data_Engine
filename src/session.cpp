@@ -155,7 +155,10 @@ void Session::on_read(beast::error_code ec, std::size_t bytes_transferred) {
     stats_.bytes_received += bytes_transferred;
 
     // MARKET_DATA_RAW=1 prints raw JSON to stdout for debugging.
-    static bool const raw_mode = std::getenv("MARKET_DATA_RAW") != nullptr;
+    static bool const raw_mode = [] {
+        auto* v = std::getenv("MARKET_DATA_RAW");
+        return v != nullptr && std::string_view(v) == "1";
+    }();
     if (raw_mode)
         std::cout << '[' << timestamp_now() << "] " << data << '\n';
 

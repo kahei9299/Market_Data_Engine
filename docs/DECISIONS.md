@@ -201,9 +201,11 @@ Rejects: >8 decimal places, negative values, empty input, non-numeric characters
 **Selected policy:**
 - Prices must be strictly positive (`> 0`). A zero-price order is meaningless.
 - Quantities must be nonnegative (`>= 0`). Zero quantity is a valid deletion signal (see GLOSSARY.md).
+- Negative values rejected including negative zero (`"-0"`, `"-0.00000000"`) — checked by inspecting the leading character before parsing.
+- Empty symbols rejected.
 - Sequence range: `U <= u`. If `U > u`, the update is malformed.
 - Each price-level entry must be a 2-element array of strings. Numeric JSON values are rejected — Binance always sends strings.
 - Decimal precision capped at 8 digits. More digits are rejected rather than silently truncated.
-- Integer overflow is checked before scaling and rejected with a clear error.
+- Integer overflow is checked before scaling and before fractional addition. The maximum representable value is `92233720368.54775807` (INT64_MAX at scale 10^8).
 
 Invalid messages increment `stats_.invalid_messages` and log the error with a truncated preview of the raw data. The session continues processing subsequent messages.

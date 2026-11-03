@@ -98,6 +98,16 @@ BOOST_AUTO_TEST_CASE(negative_rejected) {
     BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
 }
 
+BOOST_AUTO_TEST_CASE(negative_zero_rejected) {
+    auto r = parse_scaled_decimal("-0");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(negative_zero_decimal_rejected) {
+    auto r = parse_scaled_decimal("-0.00000000");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
 BOOST_AUTO_TEST_CASE(overflow_large_integer) {
     auto r = parse_scaled_decimal("99999999999999999");
     BOOST_REQUIRE(std::holds_alternative<ScaledParseError>(r));
@@ -114,6 +124,27 @@ BOOST_AUTO_TEST_CASE(boundary_max_safe_integer) {
 
 BOOST_AUTO_TEST_CASE(boundary_just_over_max) {
     auto r = parse_scaled_decimal("92233720369.0");
+    BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(exact_int64_max) {
+    // INT64_MAX = 9223372036854775807 = 92233720368.54775807 at scale 10^8
+    auto r = parse_scaled_decimal("92233720368.54775807");
+    BOOST_REQUIRE(std::holds_alternative<int64_t>(r));
+    BOOST_TEST(std::get<int64_t>(r) == std::numeric_limits<int64_t>::max());
+}
+
+BOOST_AUTO_TEST_CASE(one_past_int64_max) {
+    // 92233720368.54775808 = INT64_MAX + 1 — must be rejected
+    auto r = parse_scaled_decimal("92233720368.54775808");
+    BOOST_REQUIRE(std::holds_alternative<ScaledParseError>(r));
+    BOOST_TEST(std::get<ScaledParseError>(r).message.find("overflow") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(max_integer_with_large_frac_overflows) {
+    // 92233720368.99999999 — integer part fits but frac causes overflow
+    auto r = parse_scaled_decimal("92233720368.99999999");
     BOOST_TEST(std::holds_alternative<ScaledParseError>(r));
 }
 
@@ -358,6 +389,27 @@ BOOST_AUTO_TEST_CASE(missing_bids_array) {
 BOOST_AUTO_TEST_CASE(missing_asks_array) {
     auto r = parse_depth_update(R"({
         "e": "depthUpdate", "E": 100, "s": "X", "U": 1, "u": 2, "b": []
+    })");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(empty_symbol_rejected) {
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "",
+        "U": 1, "u": 1, "b": [], "a": []
+    })");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("empty symbol") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(fractional_overflow_through_parser) {
+    // 92233720368.54775808 overflows INT64_MAX via the fractional part.
+    // Must be caught as a parse error, not undefined behavior.
+    auto r = parse_depth_update(R"({
+        "e": "depthUpdate", "E": 100, "s": "X",
+        "U": 1, "u": 1,
+        "b": [["92233720368.54775808","1.0"]], "a": []
     })");
     BOOST_TEST(std::holds_alternative<ParseError>(r));
 }

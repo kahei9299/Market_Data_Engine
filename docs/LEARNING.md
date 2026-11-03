@@ -381,23 +381,31 @@ auto [p1, ec1] = std::from_chars(int_part.data(), int_part.data() + int_part.siz
 // 3. Combine: integer * scale + fractional (padded to kDecimalScale digits)
 int64_t result = integer * kScaleFactor;
 // frac_part "06" → 06 * 10^6 = 6000000
+if (frac > std::numeric_limits<int64_t>::max() - result)
+    return ScaledParseError{"overflows scaled representation"};
 result += frac;
 ```
 
-Overflow is checked before scaling:
+Overflow is checked at two points:
 
 ```cpp
+// Before multiplication: integer * kScaleFactor must fit int64_t.
 static constexpr int64_t kMaxInteger =
     std::numeric_limits<int64_t>::max() / kScaleFactor;
 if (integer > kMaxInteger)
     return ScaledParseError{"integer part overflows scaled representation"};
+
+// Before fractional addition: result + frac must fit int64_t.
+if (frac > std::numeric_limits<int64_t>::max() - result)
+    return ScaledParseError{"overflows scaled representation"};
 ```
 
-This prevents `integer * kScaleFactor` from wrapping. The maximum representable integer part is `92233720368` (≈ 92 billion), well above any realistic price.
+The first check prevents `integer * kScaleFactor` from wrapping. The second prevents `result + frac` from wrapping — discovered during code review when `"92233720368.54775808"` (INT64_MAX + 1) was identified as a missing boundary case. The maximum exactly representable value is `"92233720368.54775807"` (INT64_MAX = 9223372036854775807).
 
 **Pitfalls:**
 - The scale is hardcoded to 10^8. If Binance introduces a symbol with more than 8 decimal places, the parser rejects it. This is intentional — silent truncation would be worse. The constant can be promoted to a parameter when multi-symbol support is needed.
 - `int64_t` is signed. Prices and quantities are validated as nonnegative at parse time (in `parse_levels`, [`src/depth_update.cpp`](../src/depth_update.cpp)). Signed arithmetic avoids unsigned underflow surprises in future subtraction operations (e.g., order-book deltas).
+- Negative zero (`"-0"`, `"-0.00000000"`) is rejected by checking for a leading `-` character before calling `from_chars`. This is necessary because `from_chars` parses `"-0"` as `0`, which would bypass a post-parse `value < 0` check — discovered during code review.
 
 ### `std::variant` for type-safe error handling
 

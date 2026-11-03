@@ -77,7 +77,7 @@ src/
 ├── depth_update.hpp/cpp  DepthUpdate types and strict JSON parser
 └── util.hpp/cpp          Timestamp formatting, scaled decimal parser
 tests/
-└── test_main.cpp         48 unit tests (Boost.Test)
+└── test_main.cpp         53 unit tests (Boost.Test)
 docs/
 ├── DECISIONS.md          Engineering decisions log
 └── LEARNING.md           C++ and systems concepts journal
@@ -106,7 +106,7 @@ GLOSSARY.md               Domain terminology
 - Atomic parse failure — returns `ParseError` variant, never a partial `DepthUpdate`
 - Zero-quantity deletion updates accepted (Binance protocol for removing price levels)
 - Raw JSON debugging via `MARKET_DATA_RAW=1` environment variable
-- 48 unit tests (15 scaled decimal, 23 depth update parsing, 9 M1.1 networking/lifecycle, 1 buffer)
+- 53 unit tests covering scaled decimal parsing (including INT64_MAX boundary, negative zero), depth update parsing (including empty symbol, fractional overflow), and M1.1 networking/lifecycle
 
 ## Known limitations
 

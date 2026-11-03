@@ -109,6 +109,8 @@ ParseResult parse_depth_update(std::string_view data) {
     auto s_it = obj.find("s");
     if (s_it == obj.end() || !s_it->value().is_string())
         return make_error("missing or non-string field \"s\"");
+    if (s_it->value().get_string().empty())
+        return make_error("empty symbol");
 
     // Timestamps and sequence IDs.
     auto event_time = get_uint64(obj, "E");
