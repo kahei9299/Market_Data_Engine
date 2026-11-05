@@ -290,3 +290,31 @@ Invalid messages increment `stats_.invalid_messages` and log the error with a tr
 **Selected:** Check `busy_` at entry. If true, invoke the callback synchronously with "request already in flight" error. No UB, no queue, no silent drop.
 
 **Revisit if:** SyncEngine needs concurrent snapshot requests (unlikely — sequential retry is the design).
+
+## M2.3/M2.4 — Synchronization Engine
+
+### SyncEngine owns OrderBook, Session owns SyncEngine
+
+**Problem:** Where does the synchronization state machine live relative to the order book and the WebSocket session?
+
+**Selected:** `SyncEngine` owns `OrderBook` and `HttpClient`. Session owns `SyncEngine` as `std::unique_ptr`. Session routes parsed `DepthUpdate` objects to `SyncEngine::on_update()` and reads the book via `sync_engine_->book()` for display. This separates network I/O (Session) from sync logic (SyncEngine) from data (OrderBook).
+
+### Snapshot callback lifetime: `this` capture with stop() guarantee
+
+**Problem:** `SyncEngine::request_snapshot()` captures `this` in the HTTP callback. If SyncEngine is destroyed while a request is in flight, `this` becomes dangling.
+
+**Selected:** `SyncEngine::stop()` cancels the HttpClient and the retry timer before destruction. Session always calls `stop()` in its own `stop()` method. The single-threaded `io_context` guarantees no callbacks fire after `stop()` cancels them and before `run()` returns.
+
+**Revisit if:** SyncEngine is used outside Session or in a multi-threaded context.
+
+### Resync on any snapshot failure
+
+**Problem:** What to do when snapshot retrieval fails (HTTP error, parse error, transport failure)?
+
+**Selected:** Call `begin_resync()` which clears the book, buffer, and all state, returning to Buffering. The next depth update restarts the sync process. This is simpler than partial recovery and matches the Binance protocol ("discard your local order book and restart").
+
+### SyncEvent return type for Session logging
+
+**Problem:** Session needs to know the outcome of `on_update()` to decide what to print.
+
+**Selected:** `on_update()` returns `SyncEvent` enum: Applied, Stale, Buffered, Synchronized, Resyncing. Session prints best bid/ask only on Applied or Synchronized, ignoring stale and buffered events.

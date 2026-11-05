@@ -10,9 +10,11 @@ Built incrementally as a learning project for C++ systems engineering: networkin
 |---|---|---|
 | **M1.1** | Live WebSocket receiver | Complete |
 | **M1.2** | Typed depth message parsing | Complete |
-| **M2** | Order book reconstruction | In progress |
+| **M2** | Order book reconstruction | Complete |
 | **M2.1** | Order book data structure | Complete |
 | **M2.2** | Asynchronous HTTPS client | Complete |
+| **M2.3** | Synchronization engine | Complete |
+| **M2.4** | Session integration | Complete |
 
 ## Architecture
 
@@ -80,9 +82,10 @@ src/
 ├── order_book.hpp/cpp    OrderBook class (bid/ask maps, update procedure, snapshot application)
 ├── snapshot.hpp/cpp      Snapshot type and REST depth response parser
 ├── http_client.hpp/cpp   Async HTTPS client (persistent connection, lazy reconnection, TLS verification)
+├── sync_engine.hpp/cpp   Snapshot sync state machine (buffering, retry, gap detection)
 └── util.hpp/cpp          Timestamp formatting, scaled decimal parser and formatter
 tests/
-└── test_main.cpp         103 unit tests (Boost.Test)
+└── test_main.cpp         114 unit tests (Boost.Test)
 docs/
 ├── DECISIONS.md          Engineering decisions log
 └── LEARNING.md           C++ and systems concepts journal
@@ -140,13 +143,25 @@ GLOSSARY.md               Domain terminology
 - `cancel()` for clean shutdown with explicit cancelled result
 - 9 new deterministic tests using local mock HTTPS server (103 total)
 
+### M2.3/M2.4 — Synchronization Engine and Session Integration
+
+- `SyncEngine` class implementing the official Binance 7-step local order book sync protocol
+- State machine: Buffering → SnapshotPending → Synchronized with resync on failure
+- Bounded update buffer (`std::deque<DepthUpdate>`, max 1000 events, resync on overflow)
+- Exponential backoff on stale snapshots (5 retries, 1s base, 2× multiplier)
+- Sequence gap detection triggers full resynchronization
+- Snapshot validation: stale check, bridging event detection, buffered event replay
+- HTTP error, parse error, and transport failure handling with automatic resync
+- Session integration: parsed depth updates routed through SyncEngine
+- Best bid/ask with spread printed on every applied update when synchronized
+- Graceful shutdown via `SyncEngine::stop()` cancelling HTTP requests and timers
+- 11 new deterministic tests with mock HTTPS server (114 total)
+
 ## Known limitations
 
-- No snapshot synchronization — order book data structure only (M2.2–M2.4 pending)
-- No reconnection on disconnect — the process exits on any connection error
-- No sequence gap detection (`U`/`u` continuity tracking across messages)
-- No order book reconstruction
-- No latency measurement
+- No reconnection on WebSocket disconnect — process exits on connection error
+- No multi-symbol support
+- No latency measurement instrumentation
 - Scale factor hardcoded to 10^8 — sufficient for all current Binance Spot pairs
 - `timestamp_now()` uses `gmtime_r` (POSIX) — not portable to Windows
 - Namespace aliases in `session.hpp` leak into includers

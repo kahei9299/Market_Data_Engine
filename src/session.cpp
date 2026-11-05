@@ -9,14 +9,16 @@
 
 Session::Session(net::io_context& ioc, ssl::context& ctx,
                  std::string host, std::string port, std::string path,
-                 ErrorCallback on_error)
+                 ErrorCallback on_error, SyncEngine::Config sync_config)
     : resolver_(net::make_strand(ioc)),
       ws_(net::make_strand(ioc), ctx),
       buffer_(kMaxBufferSize),
       host_(std::move(host)),
       port_(std::move(port)),
       path_(std::move(path)),
-      on_error_(std::move(on_error)) {}
+      on_error_(std::move(on_error)),
+      sync_engine_(std::make_unique<SyncEngine>(ioc, ctx,
+                                                 std::move(sync_config))) {}
 
 void Session::run() {
     resolver_.async_resolve(
@@ -28,6 +30,8 @@ void Session::stop() {
     if (stopping_)
         return;
     stopping_ = true;
+    if (sync_engine_)
+        sync_engine_->stop();
     print_stats();
 
     resolver_.cancel();
@@ -170,12 +174,27 @@ void Session::on_read(beast::error_code ec, std::size_t bytes_transferred) {
                   << '\n';
     } else {
         auto const& update = std::get<DepthUpdate>(result);
-        std::cerr << '[' << timestamp_now() << "] " << update.symbol
-                  << " U=" << update.first_update_id
-                  << " u=" << update.last_update_id
-                  << " bids=" << update.bids.size()
-                  << " asks=" << update.asks.size()
-                  << " E=" << update.event_time << '\n';
+
+        auto event = sync_engine_->on_update(update);
+
+        if (event == SyncEvent::Applied ||
+            event == SyncEvent::Synchronized) {
+            auto const& book = sync_engine_->book();
+            auto bb = book.best_bid();
+            auto ba = book.best_ask();
+            std::cerr << '[' << timestamp_now() << "] "
+                      << update.symbol;
+            if (bb)
+                std::cerr << " bid=" << format_scaled(bb->first)
+                          << "x" << format_scaled(bb->second);
+            if (ba)
+                std::cerr << " ask=" << format_scaled(ba->first)
+                          << "x" << format_scaled(ba->second);
+            if (bb && ba)
+                std::cerr << " spread="
+                          << format_scaled(ba->first - bb->first);
+            std::cerr << " id=" << book.update_id() << '\n';
+        }
     }
 
     buffer_.consume(bytes_transferred);

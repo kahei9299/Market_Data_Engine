@@ -1069,16 +1069,10 @@ BOOST_AUTO_TEST_CASE(locked_book_no_warning) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
-// --- HttpClient tests (M2.2) ---
+// --- Shared mock HTTPS server for HttpClient and SyncEngine tests ---
 
 #include "http_client.hpp"
 
-BOOST_AUTO_TEST_SUITE(http_client)
-
-namespace http = boost::beast::http;
-
-// Helper: set up a mock HTTPS server on localhost with a random port.
-// Returns false (and skips the test) if local port binding is unavailable.
 struct MockServer {
     net::io_context& ioc;
     ssl::context server_ctx{ssl::context::tlsv12_server};
@@ -1158,6 +1152,10 @@ struct MockServer {
         return ctx;
     }
 };
+
+// --- HttpClient tests (M2.2) ---
+
+BOOST_AUTO_TEST_SUITE(http_client)
 
 BOOST_AUTO_TEST_CASE(successful_get_returns_body) {
     net::io_context ioc;
@@ -1481,6 +1479,298 @@ BOOST_AUTO_TEST_CASE(overlapping_request_rejected) {
     // Let the first request time out so ioc.run() completes.
     client->cancel();
     ioc.run();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// --- SyncEngine tests (M2 Phase 1) ---
+
+#include "sync_engine.hpp"
+
+BOOST_AUTO_TEST_SUITE(sync_engine)
+
+// Helper: make a DepthUpdate for testing.
+static DepthUpdate make_depth(uint64_t U, uint64_t u,
+                              std::vector<PriceLevel> bids = {},
+                              std::vector<PriceLevel> asks = {}) {
+    return DepthUpdate{"BTCUSDT", 0, U, u, std::move(bids), std::move(asks)};
+}
+
+// Helper: make a snapshot JSON response.
+static std::string snapshot_json(uint64_t last_update_id,
+                                 std::string bids = "[]",
+                                 std::string asks = "[]") {
+    return R"({"lastUpdateId":)" + std::to_string(last_update_id) +
+           R"(,"bids":)" + bids + R"(,"asks":)" + asks + "}";
+}
+
+// Helper: SyncEngine config pointing at mock server.
+static SyncEngine::Config mock_config(std::string const& port) {
+    SyncEngine::Config cfg;
+    cfg.snapshot_host = "testserver.local";
+    cfg.snapshot_port = port;
+    cfg.http_timeout = std::chrono::milliseconds(2000);
+    cfg.base_retry_delay = std::chrono::milliseconds(10);
+    return cfg;
+}
+
+BOOST_AUTO_TEST_CASE(initial_state_is_buffering) {
+    net::io_context ioc;
+    ssl::context ctx(ssl::context::tlsv12_client);
+    SyncEngine eng(ioc, ctx, SyncEngine::Config{});
+    BOOST_TEST((eng.state() == SyncState::Buffering));
+}
+
+BOOST_AUTO_TEST_CASE(first_event_buffers_and_triggers_snapshot) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Serve snapshot with lastUpdateId=100.
+    srv.serve(snapshot_json(100, R"([["50.0","1.0"]])", R"([["51.0","2.0"]])"));
+
+    auto cfg = mock_config(srv.port);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    // First event: U=101, u=101 — triggers snapshot request.
+    auto ev = eng.on_update(make_depth(101, 101, {{5000000000, 100000000}}, {}));
+    BOOST_TEST((ev == SyncEvent::Buffered));
+
+    ioc.run();
+
+    // After snapshot is applied and buffered event processed:
+    BOOST_TEST((eng.state() == SyncState::Synchronized));
+    BOOST_TEST(eng.book().update_id() == 101u);
+    BOOST_TEST(eng.book().bid_count() == 2u); // snapshot bid + update bid
+}
+
+BOOST_AUTO_TEST_CASE(stale_events_discarded_during_sync) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Snapshot at 100.
+    srv.serve(snapshot_json(100));
+
+    auto cfg = mock_config(srv.port);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    // Buffer events: some stale, one bridging, one after.
+    eng.on_update(make_depth(95, 98));  // stale (u=98 <= 100)
+    eng.on_update(make_depth(99, 101)); // bridging (U=99 <= 101, u=101 > 100)
+    eng.on_update(make_depth(102, 103, {{500, 100}}, {})); // after
+
+    ioc.run();
+
+    BOOST_TEST((eng.state() == SyncState::Synchronized));
+    BOOST_TEST(eng.book().update_id() == 103u);
+    BOOST_TEST(eng.book().bid_count() == 1u);
+}
+
+BOOST_AUTO_TEST_CASE(gap_in_synchronized_state_triggers_resync) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    srv.serve(snapshot_json(100));
+
+    auto cfg = mock_config(srv.port);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    eng.on_update(make_depth(101, 101));
+    ioc.run();
+    BOOST_TEST((eng.state() == SyncState::Synchronized));
+    BOOST_TEST(eng.book().update_id() == 101u);
+
+    // Gap: expected U=102, got U=105.
+    ioc.restart();
+    auto ev = eng.on_update(make_depth(105, 106));
+    BOOST_TEST((ev == SyncEvent::Resyncing));
+    BOOST_TEST((eng.state() == SyncState::Buffering));
+    BOOST_TEST(eng.book().update_id() == 0u);
+}
+
+BOOST_AUTO_TEST_CASE(sequential_updates_after_sync) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    srv.serve(snapshot_json(100));
+
+    auto cfg = mock_config(srv.port);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    eng.on_update(make_depth(101, 101));
+    ioc.run();
+
+    ioc.restart();
+    auto ev1 = eng.on_update(make_depth(102, 103, {{500, 100}}, {{600, 200}}));
+    BOOST_TEST((ev1 == SyncEvent::Applied));
+    BOOST_TEST(eng.book().bid_count() == 1u);
+    BOOST_TEST(eng.book().ask_count() == 1u);
+
+    auto ev2 = eng.on_update(make_depth(104, 104, {{500, 0}}, {}));
+    BOOST_TEST((ev2 == SyncEvent::Applied));
+    BOOST_TEST(eng.book().bid_count() == 0u);
+}
+
+BOOST_AUTO_TEST_CASE(stale_snapshot_retries) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // First snapshot is stale (lastUpdateId=50 < first U=101).
+    // Second snapshot is fresh (lastUpdateId=100).
+    srv.serve(snapshot_json(50));
+
+    auto cfg = mock_config(srv.port);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    eng.on_update(make_depth(101, 101));
+    ioc.run();
+
+    // After stale snapshot, engine should have retried.
+    // The retry timer will fire but the second snapshot request
+    // needs a server. Serve it now.
+    ioc.restart();
+    srv.serve(snapshot_json(100));
+    ioc.run();
+
+    BOOST_TEST((eng.state() == SyncState::Synchronized));
+    BOOST_TEST(eng.book().update_id() == 101u);
+}
+
+BOOST_AUTO_TEST_CASE(buffer_overflow_triggers_resync) {
+    net::io_context ioc;
+    ssl::context ctx(ssl::context::tlsv12_client);
+    SyncEngine::Config cfg;
+    cfg.snapshot_host = "127.0.0.1";
+    cfg.snapshot_port = "1"; // nothing listening
+    cfg.http_timeout = std::chrono::milliseconds(100);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    // Fill buffer to max.
+    for (std::size_t i = 0; i < SyncEngine::kMaxBufferSize; ++i) {
+        eng.on_update(make_depth(i + 1, i + 1));
+    }
+
+    // Next event overflows.
+    auto ev = eng.on_update(make_depth(9999, 9999));
+    BOOST_TEST((ev == SyncEvent::Resyncing));
+    BOOST_TEST((eng.state() == SyncState::Buffering));
+}
+
+BOOST_AUTO_TEST_CASE(snapshot_http_error_triggers_resync) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Return 500 error.
+    srv.serve(R"({"error":"internal"})", 500);
+
+    auto cfg = mock_config(srv.port);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    eng.on_update(make_depth(101, 101));
+    ioc.run();
+
+    BOOST_TEST((eng.state() == SyncState::Buffering));
+}
+
+BOOST_AUTO_TEST_CASE(malformed_snapshot_triggers_resync) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    srv.serve("not json");
+
+    auto cfg = mock_config(srv.port);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    eng.on_update(make_depth(101, 101));
+    ioc.run();
+
+    BOOST_TEST((eng.state() == SyncState::Buffering));
+}
+
+BOOST_AUTO_TEST_CASE(no_bridging_event_triggers_resync) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Snapshot at 100, but only buffered event has U=200 (huge gap).
+    srv.serve(snapshot_json(100));
+
+    auto cfg = mock_config(srv.port);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    eng.on_update(make_depth(200, 201));
+    ioc.run();
+
+    BOOST_TEST((eng.state() == SyncState::Buffering));
+}
+
+BOOST_AUTO_TEST_CASE(stop_cancels_pending_work) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Server accepts but never responds.
+    auto server_stream =
+        std::make_shared<ssl::stream<tcp::socket>>(ioc, srv.server_ctx);
+    srv.acceptor.async_accept(server_stream->next_layer(),
+        [server_stream](beast::error_code ec) {
+            if (ec) return;
+            server_stream->async_handshake(ssl::stream_base::server,
+                [](beast::error_code) {});
+        });
+
+    auto cfg = mock_config(srv.port);
+    SyncEngine eng(ioc, ctx, cfg);
+
+    eng.on_update(make_depth(101, 101));
+
+    // Post stop after one tick.
+    net::post(ioc, [&eng]() { eng.stop(); });
+
+    ioc.run();
+    // Should not hang — stop cancels the HTTP request.
 }
 
 BOOST_AUTO_TEST_SUITE_END()

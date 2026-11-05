@@ -677,3 +677,47 @@ uint64_t abs_val = negative
 **Pitfalls:**
 - `body_limit` must be set on the parser, not on the response object. Setting it on `http::response` has no effect.
 - The parser is not copyable or movable once reading has started. Using `std::optional` and `emplace()` lets us create a fresh parser for each request.
+
+## M2.3/M2.4 — Synchronization Engine
+
+### State machine with enum class
+
+**What:** The synchronization protocol has three states (Buffering, SnapshotPending, Synchronized) and transitions triggered by events (first update, snapshot response, sequence gap). We model this as an `enum class SyncState` with a `switch` in `on_update()`.
+
+**Where:** `SyncEngine` in [`src/sync_engine.hpp`](../src/sync_engine.hpp) — `state_` member and `SyncState` enum.
+
+**Why:** The Binance sync protocol is inherently stateful: you buffer events, request a snapshot, validate and apply it, then switch to live processing. An explicit state enum makes transitions visible and testable without a state machine framework.
+
+**How:** `on_update()` switches on `state_`. In Buffering/SnapshotPending, events are pushed to the deque buffer. In Synchronized, events go directly to `book_.apply_update()`. State transitions are function calls: `request_snapshot()` sets SnapshotPending, `apply_snapshot_and_sync()` sets Synchronized, `begin_resync()` resets to Buffering.
+
+**Pitfalls:**
+- The state machine must be re-entrant safe: `on_update()` is called from Session's read loop, and snapshot callbacks are called from the io_context. In our single-threaded model, these never overlap.
+- `begin_resync()` must reset ALL state: book, buffer, flags, retry count, and timer. Missing any one leaves stale data that corrupts the next sync cycle.
+
+### Asynchronous callback chains across object boundaries
+
+**What:** SyncEngine calls `http_client_->async_get()`, whose callback calls `on_snapshot_response()` on SyncEngine, which may start a retry timer, whose callback calls `request_snapshot()` again. This chain crosses object boundaries (SyncEngine → HttpClient → SyncEngine).
+
+**Where:** `request_snapshot()` and `on_snapshot_response()` in [`src/sync_engine.cpp`](../src/sync_engine.cpp).
+
+**Why:** The async model means these operations are non-blocking. The io_context dispatches callbacks as responses arrive. The chain is linear (not concurrent) in our single-threaded model.
+
+**How:** The HTTP callback captures `this` (SyncEngine pointer) and `self` (shared_ptr to HttpClient, keeping it alive). The retry timer callback captures `this`. Both rely on SyncEngine outliving the callbacks, which is guaranteed by the stop-before-destroy contract.
+
+**Pitfalls:**
+- Capturing `this` in an async callback is a use-after-free risk if the object is destroyed before the callback fires. Our mitigation: `stop()` cancels all outstanding operations. The single-threaded io_context guarantees cancelled callbacks don't fire after cancellation returns.
+- The retry timer creates a second pending operation alongside the io_context's normal event processing. Both are single-threaded and serialized by `io_context::run()`.
+
+### `std::deque` for bounded FIFO buffering
+
+**What:** `std::deque<DepthUpdate>` stores WebSocket depth events while waiting for a REST snapshot. Bounded to 1000 entries with resync on overflow.
+
+**Where:** `SyncEngine::buffer_` in [`src/sync_engine.hpp`](../src/sync_engine.hpp). Populated in `on_update()` during Buffering/SnapshotPending states. Drained in `apply_snapshot_and_sync()`.
+
+**Why:** During the time between receiving the first WebSocket event and completing the snapshot request, events must be stored in arrival order. `std::deque` provides O(1) push_back and O(1) pop_front. `std::vector` would require O(n) shifting on pop_front.
+
+**How:** Events are pushed in `on_update()`. After the snapshot arrives, stale events (u <= lastUpdateId) are popped from the front. The remaining events are applied to the book in order. The buffer is cleared on resync.
+
+**Pitfalls:**
+- The 1000-event bound at ~1 event/sec gives ~16 minutes of buffering. An unresponsive REST endpoint that takes >16 minutes triggers a resync rather than unbounded memory growth.
+- `deque` allocates in chunks. For 1000 `DepthUpdate` objects (each containing two vectors), peak memory is significant but bounded.
