@@ -10,7 +10,8 @@ Built incrementally as a learning project for C++ systems engineering: networkin
 |---|---|---|
 | **M1.1** | Live WebSocket receiver | Complete |
 | **M1.2** | Typed depth message parsing | Complete |
-| **M2** | Order book reconstruction | Planned |
+| **M2** | Order book reconstruction | In progress |
+| **M2.1** | Order book data structure | Complete |
 
 ## Architecture
 
@@ -74,8 +75,10 @@ MARKET_DATA_RAW=1 ./build/market-data-engine
 src/
 ├── main.cpp              Entry point, io_context, signal handling, error callback
 ├── session.hpp/cpp       Async WebSocket session (connect, TLS, read loop)
-├── depth_update.hpp/cpp  DepthUpdate types and strict JSON parser
-└── util.hpp/cpp          Timestamp formatting, scaled decimal parser
+├── depth_update.hpp/cpp  DepthUpdate types, strict JSON parser, shared parse helpers
+├── order_book.hpp/cpp    OrderBook class (bid/ask maps, update procedure, snapshot application)
+├── snapshot.hpp/cpp      Snapshot type and REST depth response parser
+└── util.hpp/cpp          Timestamp formatting, scaled decimal parser and formatter
 tests/
 └── test_main.cpp         53 unit tests (Boost.Test)
 docs/
@@ -106,10 +109,24 @@ GLOSSARY.md               Domain terminology
 - Atomic parse failure — returns `ParseError` variant, never a partial `DepthUpdate`
 - Zero-quantity deletion updates accepted (Binance protocol for removing price levels)
 - Raw JSON debugging via `MARKET_DATA_RAW=1` environment variable
-- 53 unit tests covering scaled decimal parsing (including INT64_MAX boundary, negative zero), depth update parsing (including empty symbol, fractional overflow), and M1.1 networking/lifecycle
+- 90 unit tests covering scaled decimal parsing (including INT64_MAX boundary, negative zero), depth update parsing (including empty symbol, fractional overflow), snapshot parsing, order book operations, format_scaled, and M1.1 networking/lifecycle
+
+### M2.1 — Order Book Data Structure
+
+- `OrderBook` class with `std::map<int64_t, int64_t>` for bids (descending) and asks (ascending)
+- Snapshot application: full book replacement with update ID tracking
+- Differential update application per Binance protocol (Applied, Stale, Gap detection)
+- Best bid/ask retrieval as `std::optional<std::pair<int64_t, int64_t>>`
+- Crossed book detection (best bid >= best ask) with stderr warning
+- `Snapshot` struct and `parse_snapshot()` parser for REST `/api/v3/depth` responses
+- Zero-quantity snapshot entries silently skipped
+- `format_scaled()` utility for converting scaled integers to human-readable decimals
+- Shared `parse_levels()` and `get_uint64()` helpers extracted from M1.2 for reuse
+- 35 new unit tests (90 total)
 
 ## Known limitations
 
+- No snapshot synchronization — order book data structure only (M2.2–M2.4 pending)
 - No reconnection on disconnect — the process exits on any connection error
 - No sequence gap detection (`U`/`u` continuity tracking across messages)
 - No order book reconstruction

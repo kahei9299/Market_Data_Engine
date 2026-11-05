@@ -2,7 +2,9 @@
 #include <boost/test/unit_test.hpp>
 
 #include "depth_update.hpp"
+#include "order_book.hpp"
 #include "session.hpp"
+#include "snapshot.hpp"
 #include "util.hpp"
 
 #include <boost/beast/core/flat_buffer.hpp>
@@ -632,6 +634,356 @@ BOOST_AUTO_TEST_CASE(stats_zero_when_never_connected) {
     BOOST_TEST(stats.invalid_messages == 0u);
     BOOST_TEST(
         (stats.connected_at == std::chrono::steady_clock::time_point{}));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// --- format_scaled tests (M2.1) ---
+
+BOOST_AUTO_TEST_SUITE(format_scaled_tests)
+
+BOOST_AUTO_TEST_CASE(whole_number) {
+    BOOST_TEST(format_scaled(100'000'000LL) == "1");
+}
+
+BOOST_AUTO_TEST_CASE(zero_value) {
+    BOOST_TEST(format_scaled(0) == "0");
+}
+
+BOOST_AUTO_TEST_CASE(fractional_trimmed) {
+    // 78450.06 = 7845006000000
+    BOOST_TEST(format_scaled(7845006000000LL) == "78450.06");
+}
+
+BOOST_AUTO_TEST_CASE(full_precision_no_trim) {
+    // 0.12345678 = 12345678
+    BOOST_TEST(format_scaled(12345678LL) == "0.12345678");
+}
+
+BOOST_AUTO_TEST_CASE(trailing_zeros_trimmed) {
+    // 1.5 = 150000000
+    BOOST_TEST(format_scaled(150'000'000LL) == "1.5");
+}
+
+BOOST_AUTO_TEST_CASE(large_value) {
+    // 92233720368.54775807 = INT64_MAX
+    BOOST_TEST(format_scaled(std::numeric_limits<int64_t>::max()) ==
+               "92233720368.54775807");
+}
+
+BOOST_AUTO_TEST_CASE(single_satoshi) {
+    // 0.00000001 = 1
+    BOOST_TEST(format_scaled(1LL) == "0.00000001");
+}
+
+BOOST_AUTO_TEST_CASE(negative_value) {
+    BOOST_TEST(format_scaled(-150'000'000LL) == "-1.5");
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// --- snapshot parsing tests (M2.1) ---
+
+BOOST_AUTO_TEST_SUITE(snapshot_parsing)
+
+static const std::string kValidSnapshot = R"({
+    "lastUpdateId": 1027024,
+    "bids": [["4.00000000","431.00000000"],["3.99000000","5.00000000"]],
+    "asks": [["4.00000200","12.00000000"]]
+})";
+
+BOOST_AUTO_TEST_CASE(valid_snapshot_parses) {
+    auto r = parse_snapshot(kValidSnapshot);
+    BOOST_REQUIRE(std::holds_alternative<Snapshot>(r));
+    auto const& s = std::get<Snapshot>(r);
+    BOOST_TEST(s.last_update_id == 1027024ULL);
+    BOOST_TEST(s.bids.size() == 2u);
+    BOOST_TEST(s.asks.size() == 1u);
+    BOOST_TEST(s.bids[0].price == 400000000LL);
+    BOOST_TEST(s.bids[0].quantity == 43100000000LL);
+    BOOST_TEST(s.bids[1].price == 399000000LL);
+    BOOST_TEST(s.asks[0].price == 400000200LL);
+}
+
+BOOST_AUTO_TEST_CASE(empty_bids_and_asks) {
+    auto r = parse_snapshot(R"({"lastUpdateId": 100, "bids": [], "asks": []})");
+    BOOST_REQUIRE(std::holds_alternative<Snapshot>(r));
+    auto const& s = std::get<Snapshot>(r);
+    BOOST_TEST(s.last_update_id == 100ULL);
+    BOOST_TEST(s.bids.empty());
+    BOOST_TEST(s.asks.empty());
+}
+
+BOOST_AUTO_TEST_CASE(zero_quantity_entries_skipped) {
+    auto r = parse_snapshot(R"({
+        "lastUpdateId": 100,
+        "bids": [["1.0","0.00000000"],["2.0","1.0"]],
+        "asks": [["3.0","0.00000000"]]
+    })");
+    BOOST_REQUIRE(std::holds_alternative<Snapshot>(r));
+    auto const& s = std::get<Snapshot>(r);
+    BOOST_TEST(s.bids.size() == 1u);
+    BOOST_TEST(s.bids[0].price == 200000000LL);
+    BOOST_TEST(s.asks.empty());
+}
+
+BOOST_AUTO_TEST_CASE(missing_last_update_id) {
+    auto r = parse_snapshot(R"({"bids": [], "asks": []})");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(missing_bids) {
+    auto r = parse_snapshot(R"({"lastUpdateId": 100, "asks": []})");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(missing_asks) {
+    auto r = parse_snapshot(R"({"lastUpdateId": 100, "bids": []})");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(invalid_json) {
+    auto r = parse_snapshot("not json");
+    BOOST_REQUIRE(std::holds_alternative<ParseError>(r));
+    BOOST_TEST(std::get<ParseError>(r).message.find("invalid JSON") !=
+               std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(not_an_object) {
+    auto r = parse_snapshot("[1,2,3]");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(negative_last_update_id) {
+    auto r = parse_snapshot(R"({"lastUpdateId": -1, "bids": [], "asks": []})");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_CASE(malformed_price_in_snapshot) {
+    auto r = parse_snapshot(R"({
+        "lastUpdateId": 100,
+        "bids": [["abc","1.0"]], "asks": []
+    })");
+    BOOST_TEST(std::holds_alternative<ParseError>(r));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// --- order book tests (M2.1) ---
+
+BOOST_AUTO_TEST_SUITE(order_book)
+
+// Helper to build a DepthUpdate for testing.
+static DepthUpdate make_update(uint64_t U, uint64_t u,
+                               std::vector<PriceLevel> bids = {},
+                               std::vector<PriceLevel> asks = {}) {
+    return DepthUpdate{"BTCUSDT", 0, U, u, std::move(bids), std::move(asks)};
+}
+
+BOOST_AUTO_TEST_CASE(empty_book_has_no_best) {
+    OrderBook book;
+    BOOST_TEST(!book.best_bid().has_value());
+    BOOST_TEST(!book.best_ask().has_value());
+    BOOST_TEST(book.update_id() == 0u);
+    BOOST_TEST(book.bid_count() == 0u);
+    BOOST_TEST(book.ask_count() == 0u);
+}
+
+BOOST_AUTO_TEST_CASE(apply_snapshot_replaces_book) {
+    OrderBook book;
+
+    Snapshot snap{1000,
+                  {{200'000'000, 500'000'000}, {100'000'000, 300'000'000}},
+                  {{300'000'000, 100'000'000}}};
+    book.apply_snapshot(snap);
+
+    BOOST_TEST(book.update_id() == 1000u);
+    BOOST_TEST(book.bid_count() == 2u);
+    BOOST_TEST(book.ask_count() == 1u);
+
+    auto bb = book.best_bid();
+    BOOST_REQUIRE(bb.has_value());
+    BOOST_TEST(bb->first == 200'000'000);
+    BOOST_TEST(bb->second == 500'000'000);
+
+    auto ba = book.best_ask();
+    BOOST_REQUIRE(ba.has_value());
+    BOOST_TEST(ba->first == 300'000'000);
+    BOOST_TEST(ba->second == 100'000'000);
+}
+
+BOOST_AUTO_TEST_CASE(snapshot_clears_previous_state) {
+    OrderBook book;
+
+    Snapshot snap1{100, {{500, 100}}, {{600, 200}}};
+    book.apply_snapshot(snap1);
+    BOOST_TEST(book.bid_count() == 1u);
+
+    Snapshot snap2{200, {}, {{700, 300}}};
+    book.apply_snapshot(snap2);
+    BOOST_TEST(book.bid_count() == 0u);
+    BOOST_TEST(book.ask_count() == 1u);
+    BOOST_TEST(book.update_id() == 200u);
+    BOOST_TEST(!book.best_bid().has_value());
+}
+
+BOOST_AUTO_TEST_CASE(apply_update_inserts_new_level) {
+    OrderBook book;
+    Snapshot snap{100, {}, {}};
+    book.apply_snapshot(snap);
+
+    auto result = book.apply_update(
+        make_update(101, 101, {{500, 100}}, {}));
+    BOOST_TEST((result == UpdateResult::Applied));
+    BOOST_TEST(book.bid_count() == 1u);
+    BOOST_TEST(book.best_bid()->first == 500);
+}
+
+BOOST_AUTO_TEST_CASE(apply_update_replaces_quantity) {
+    OrderBook book;
+    Snapshot snap{100, {{500, 100}}, {}};
+    book.apply_snapshot(snap);
+
+    auto result = book.apply_update(
+        make_update(101, 101, {{500, 999}}, {}));
+    BOOST_TEST((result == UpdateResult::Applied));
+    BOOST_TEST(book.best_bid()->second == 999);
+}
+
+BOOST_AUTO_TEST_CASE(apply_update_deletes_zero_quantity) {
+    OrderBook book;
+    Snapshot snap{100, {{500, 100}, {400, 200}}, {}};
+    book.apply_snapshot(snap);
+
+    auto result = book.apply_update(
+        make_update(101, 101, {{500, 0}}, {}));
+    BOOST_TEST((result == UpdateResult::Applied));
+    BOOST_TEST(book.bid_count() == 1u);
+    BOOST_TEST(book.best_bid()->first == 400);
+}
+
+BOOST_AUTO_TEST_CASE(delete_nonexistent_is_noop) {
+    OrderBook book;
+    Snapshot snap{100, {{500, 100}}, {}};
+    book.apply_snapshot(snap);
+
+    auto result = book.apply_update(
+        make_update(101, 101, {{999, 0}}, {}));
+    BOOST_TEST((result == UpdateResult::Applied));
+    BOOST_TEST(book.bid_count() == 1u);
+}
+
+BOOST_AUTO_TEST_CASE(stale_update_ignored) {
+    OrderBook book;
+    Snapshot snap{100, {{500, 100}}, {}};
+    book.apply_snapshot(snap);
+
+    auto result = book.apply_update(make_update(50, 99, {{500, 999}}, {}));
+    BOOST_TEST((result == UpdateResult::Stale));
+    BOOST_TEST(book.best_bid()->second == 100);
+    BOOST_TEST(book.update_id() == 100u);
+}
+
+BOOST_AUTO_TEST_CASE(stale_update_u_equals_update_id) {
+    OrderBook book;
+    Snapshot snap{100, {}, {}};
+    book.apply_snapshot(snap);
+
+    auto result = book.apply_update(make_update(99, 100, {{500, 100}}, {}));
+    BOOST_TEST((result == UpdateResult::Stale));
+}
+
+BOOST_AUTO_TEST_CASE(gap_detected) {
+    OrderBook book;
+    Snapshot snap{100, {{500, 100}}, {}};
+    book.apply_snapshot(snap);
+
+    // U=103 but book is at 100, so expected U <= 101.
+    auto result = book.apply_update(make_update(103, 105, {{500, 999}}, {}));
+    BOOST_TEST((result == UpdateResult::Gap));
+    BOOST_TEST(book.best_bid()->second == 100);
+    BOOST_TEST(book.update_id() == 100u);
+}
+
+BOOST_AUTO_TEST_CASE(sequential_updates_advance_id) {
+    OrderBook book;
+    Snapshot snap{100, {}, {}};
+    book.apply_snapshot(snap);
+
+    BOOST_TEST((book.apply_update(
+        make_update(101, 105, {{500, 100}}, {})) == UpdateResult::Applied));
+    BOOST_TEST(book.update_id() == 105u);
+
+    BOOST_TEST((book.apply_update(
+        make_update(106, 110, {{600, 200}}, {})) == UpdateResult::Applied));
+    BOOST_TEST(book.update_id() == 110u);
+    BOOST_TEST(book.bid_count() == 2u);
+}
+
+BOOST_AUTO_TEST_CASE(update_empties_book) {
+    OrderBook book;
+    Snapshot snap{100, {{500, 100}}, {{600, 200}}};
+    book.apply_snapshot(snap);
+
+    auto result = book.apply_update(
+        make_update(101, 101, {{500, 0}}, {{600, 0}}));
+    BOOST_TEST((result == UpdateResult::Applied));
+    BOOST_TEST(book.bid_count() == 0u);
+    BOOST_TEST(book.ask_count() == 0u);
+    BOOST_TEST(!book.best_bid().has_value());
+    BOOST_TEST(!book.best_ask().has_value());
+}
+
+BOOST_AUTO_TEST_CASE(best_bid_is_highest_price) {
+    OrderBook book;
+    Snapshot snap{100, {{100, 10}, {300, 30}, {200, 20}}, {}};
+    book.apply_snapshot(snap);
+
+    BOOST_TEST(book.best_bid()->first == 300);
+    BOOST_TEST(book.best_bid()->second == 30);
+}
+
+BOOST_AUTO_TEST_CASE(best_ask_is_lowest_price) {
+    OrderBook book;
+    Snapshot snap{100, {}, {{300, 30}, {100, 10}, {200, 20}}};
+    book.apply_snapshot(snap);
+
+    BOOST_TEST(book.best_ask()->first == 100);
+    BOOST_TEST(book.best_ask()->second == 10);
+}
+
+BOOST_AUTO_TEST_CASE(bridging_update_U_leq_update_id_plus_1) {
+    // The first update after a snapshot may have U <= lastUpdateId + 1
+    // as long as u > lastUpdateId (the bridging event from step 5).
+    OrderBook book;
+    Snapshot snap{100, {}, {}};
+    book.apply_snapshot(snap);
+
+    // U=98, u=103 — U <= 101 and u > 100 → should apply.
+    auto result = book.apply_update(
+        make_update(98, 103, {{500, 100}}, {}));
+    BOOST_TEST((result == UpdateResult::Applied));
+    BOOST_TEST(book.update_id() == 103u);
+}
+
+BOOST_AUTO_TEST_CASE(snapshot_with_empty_one_side) {
+    OrderBook book;
+    Snapshot snap{100, {{500, 100}}, {}};
+    book.apply_snapshot(snap);
+
+    BOOST_TEST(book.bid_count() == 1u);
+    BOOST_TEST(book.ask_count() == 0u);
+    BOOST_TEST(book.best_bid().has_value());
+    BOOST_TEST(!book.best_ask().has_value());
+}
+
+BOOST_AUTO_TEST_CASE(update_on_uninitialized_book_is_gap) {
+    // Book starts with update_id=0. An update with U=1 would need
+    // update_id+1=1, which matches U=1 → Applied.
+    // But an update with U=5 → Gap.
+    OrderBook book;
+    auto result = book.apply_update(make_update(5, 10, {{500, 100}}, {}));
+    BOOST_TEST((result == UpdateResult::Gap));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

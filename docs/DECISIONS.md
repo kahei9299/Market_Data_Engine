@@ -209,3 +209,46 @@ Rejects: >8 decimal places, negative values, empty input, non-numeric characters
 - Integer overflow is checked before scaling and before fractional addition. The maximum representable value is `92233720368.54775807` (INT64_MAX at scale 10^8).
 
 Invalid messages increment `stats_.invalid_messages` and log the error with a truncated preview of the raw data. The session continues processing subsequent messages.
+
+## M2.1 — Order Book Data Structure
+
+### Order book data structure: `std::map<int64_t, int64_t>` per side
+
+**Problem:** Need a container mapping prices to quantities on each side of the book. Operations: insert/update/delete levels, best bid/ask retrieval, sorted iteration.
+
+**Options considered:**
+- `std::map<int64_t, int64_t>` — O(log n) insert/delete, O(1) best via `rbegin()`/`begin()`, always sorted. Node-based (heap allocation per entry).
+- `std::unordered_map<int64_t, int64_t>` — O(1) amortized insert/delete, but O(n) best price (must scan), O(n log n) sorted iteration.
+- Sorted `std::vector<std::pair<int64_t, int64_t>>` — O(n) insert/delete (shift), O(1) best, excellent cache locality.
+
+**Selected:** `std::map`. At our scale (~50–100 price levels per side, ~1 update/sec), complexity differences are negligible. `std::map` gives correct-by-default sorted ordering and O(1) best bid/ask via reverse/forward iterators.
+
+**Tradeoff:** Node-based allocation has poor cache locality, but the entire tree fits in L1/L2 cache at 100 entries. Sorted `std::vector` would have better locality but O(n) insert/delete.
+
+**Revisit if:** Profiling shows map operations on the hot path, or book depth grows significantly.
+
+### Update ID tracking inside OrderBook
+
+**Problem:** Where should the Binance update procedure (stale check, gap detection, update ID advancement) live?
+
+**Options considered:**
+- Inside `OrderBook` — `apply_update()` checks `U`/`u` continuity and returns `Applied`/`Stale`/`Gap`.
+- In `SyncEngine` — OrderBook is a dumb container, caller checks continuity.
+
+**Selected:** Inside `OrderBook`. The update procedure is 10 lines. Putting it in OrderBook keeps `SyncEngine::on_update()` trivially simple: call `book.apply_update()`, switch on the result. Exchange-agnosticism (keeping OrderBook generic) is YAGNI.
+
+**Revisit if:** Multi-exchange support is needed.
+
+### Snapshot application: full replacement
+
+**Problem:** When applying a snapshot, should we clear the book and re-insert, or merge with existing state?
+
+**Selected:** Full replacement. Clear both maps, insert all snapshot levels, set `update_id = lastUpdateId`. Matches the Binance protocol ("Set your local order book to the snapshot") exactly. Merge would risk leaving stale levels.
+
+### Shared parsing helpers: `parse_levels` and `get_uint64`
+
+**Problem:** Both `parse_depth_update` and `parse_snapshot` need to parse `[price, quantity]` arrays and extract uint64 fields from JSON objects.
+
+**Selected:** Extracted `parse_levels()` and `get_uint64()` from the anonymous namespace in `depth_update.cpp` to shared declarations in `depth_update.hpp`. `parse_levels` gained a `skip_zero_qty` parameter (default `false`) — depth updates include zero-quantity entries (deletion signals), snapshots skip them (they carry no book state).
+
+**Tradeoff:** Exposes internal parsing functions in the header. Acceptable because the functions are genuinely shared and the alternative is code duplication.
