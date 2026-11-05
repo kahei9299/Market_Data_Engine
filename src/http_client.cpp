@@ -69,6 +69,15 @@ void HttpClient::cancel() {
     close_socket();
 }
 
+void HttpClient::abort() {
+    cancel();
+    // Invalidate the current request gen so stale callbacks are ignored,
+    // then clear busy so a new request can be accepted immediately.
+    ++request_gen_;
+    busy_ = false;
+    cb_ = nullptr;
+}
+
 void HttpClient::complete(Result result, uint64_t gen) {
     if (!busy_ || gen != request_gen_)
         return;

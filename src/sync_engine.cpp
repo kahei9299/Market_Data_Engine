@@ -212,6 +212,7 @@ void SyncEngine::begin_resync() {
     ++sync_gen_;
     state_ = SyncState::Buffering;
     retry_timer_.cancel();
+    http_client_->abort();
 }
 
 std::string SyncEngine::snapshot_target() const {

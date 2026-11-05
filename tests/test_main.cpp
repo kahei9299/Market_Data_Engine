@@ -2104,4 +2104,69 @@ BOOST_AUTO_TEST_CASE(tls_verified_local_https) {
     BOOST_TEST(resp->body == R"({"status":"ok"})");
 }
 
+BOOST_AUTO_TEST_CASE(resync_recovery_after_inflight_abort) {
+    // Reproduce: buffer overflow while snapshot is in flight (server hangs).
+    // After resync, the next event must successfully trigger a new snapshot
+    // without waiting for the old request's timeout.
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // First snapshot: server accepts TLS but never responds.
+    auto ss = std::make_shared<ssl::stream<tcp::socket>>(ioc, srv.server_ctx);
+    srv.acceptor.async_accept(ss->next_layer(),
+        [ss](beast::error_code ec) {
+            if (ec) return;
+            ss->async_handshake(ssl::stream_base::server,
+                [](beast::error_code) {});
+        });
+
+    auto cfg = mock_config(srv.port);
+    cfg.http_timeout = std::chrono::seconds(5);
+    auto eng = std::make_shared<SyncEngine>(ioc, ctx, cfg);
+
+    // First event triggers snapshot request (hangs).
+    eng->on_update(make_depth(101, 102));
+    BOOST_TEST((eng->state() == SyncState::SnapshotPending));
+
+    // Fill buffer to overflow → resync. This calls abort() on HttpClient.
+    for (std::size_t i = 1; i < SyncEngine::kMaxBufferSize; ++i) {
+        eng->on_update(make_depth(102 + i, 102 + i));
+    }
+    auto ev = eng->on_update(make_depth(9999, 9999));
+    BOOST_TEST((ev == SyncEvent::Resyncing));
+    BOOST_TEST((eng->state() == SyncState::Buffering));
+
+    // Close the hung server connection so it doesn't block ioc.run().
+    srv.acceptor.close();
+    { beast::error_code ec; ss->next_layer().close(ec); }
+
+    // Re-open acceptor and serve a fresh snapshot for the new sync cycle.
+    {
+        beast::error_code ec;
+        srv.acceptor.open(tcp::v4(), ec);
+        srv.acceptor.set_option(net::socket_base::reuse_address(true), ec);
+        srv.acceptor.bind(tcp::endpoint(net::ip::make_address("127.0.0.1"),
+                          std::stoi(srv.port)), ec);
+        srv.acceptor.listen(4, ec);
+    }
+    srv.serve(snapshot_json(301, R"([["60.0","5.0"]])", R"([["61.0","3.0"]])"));
+
+    // New first event triggers new snapshot — should succeed immediately.
+    eng->on_update(make_depth(301, 302, {{5900000000, 100000000}}, {}));
+    BOOST_TEST((eng->state() == SyncState::SnapshotPending));
+
+    ioc.run();
+
+    // Should synchronize without waiting for the 5-second old timeout.
+    BOOST_TEST((eng->state() == SyncState::Synchronized));
+    BOOST_TEST(eng->book().update_id() == 302u);
+    BOOST_TEST(eng->book().bid_count() == 2u);
+    BOOST_TEST(eng->book().ask_count() == 1u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

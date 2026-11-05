@@ -49,6 +49,11 @@ class HttpClient : public std::enable_shared_from_this<HttpClient> {
     void async_get(std::string target, Callback cb);
     void cancel();
 
+    // Cancel any in-flight request and reset to idle without invoking
+    // the callback. Use when the caller has already invalidated the
+    // callback context (e.g., sync generation change).
+    void abort();
+
   private:
     static constexpr std::size_t kMaxBodySize = 2 * 1024 * 1024; // 2 MB
 
