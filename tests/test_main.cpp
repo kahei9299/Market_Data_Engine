@@ -12,8 +12,10 @@
 #include <openssl/x509v3.h>
 #include <atomic>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <regex>
+#include <sstream>
 #include <string>
 
 // --- timestamp_now tests (M1.1) ---
@@ -1005,41 +1007,37 @@ BOOST_AUTO_TEST_CASE(snapshot_zero_quantity_not_stored) {
     BOOST_TEST(book.best_ask()->first == 700);
 }
 
-BOOST_AUTO_TEST_CASE(uint64_max_update_id_is_gap) {
-    // When update_id_ == UINT64_MAX, no further update can be valid.
-    // Without the overflow guard, update_id_ + 1 wraps to 0, and
-    // any U <= 0 would be incorrectly accepted.
+BOOST_AUTO_TEST_CASE(uint64_max_update_id_all_updates_stale) {
+    // When update_id_ == UINT64_MAX, every possible u fits in uint64 and
+    // satisfies u <= UINT64_MAX, so the stale check rejects all updates
+    // before the overflow guard is reached. The guard (update_id_ ==
+    // UINT64_MAX → Gap) is retained defensively in case the check order
+    // changes, but is currently unreachable from this state.
     OrderBook book;
     Snapshot snap{UINT64_MAX, {{500, 100}}, {}};
     book.apply_snapshot(snap);
     BOOST_TEST(book.update_id() == UINT64_MAX);
 
-    // u <= UINT64_MAX → Stale (caught by first check).
+    // u=1 < UINT64_MAX → Stale.
     auto result = book.apply_update(make_update(0, 1, {{500, 200}}, {}));
     BOOST_TEST((result == UpdateResult::Stale));
 
-    // u == UINT64_MAX → also Stale.
+    // u=UINT64_MAX == update_id_ → Stale (<=, not <).
     auto result2 = book.apply_update(
         make_update(0, UINT64_MAX, {{500, 300}}, {}));
     BOOST_TEST((result2 == UpdateResult::Stale));
 
-    // The only update that would pass the stale check is u > UINT64_MAX,
-    // which is impossible in uint64. But to verify the gap guard works,
-    // set update_id to UINT64_MAX - 1, then send U that would wrap.
+    // Verify the book was never modified.
+    BOOST_TEST(book.best_bid()->second == 100);
+
+    // Verify the last valid transition into UINT64_MAX works correctly.
     Snapshot snap2{UINT64_MAX - 1, {{500, 100}}, {}};
     book.apply_snapshot(snap2);
 
-    // U=UINT64_MAX, u=UINT64_MAX: U == update_id_ + 1, so this is valid.
     auto result3 = book.apply_update(
         make_update(UINT64_MAX, UINT64_MAX, {{500, 200}}, {}));
     BOOST_TEST((result3 == UpdateResult::Applied));
     BOOST_TEST(book.update_id() == UINT64_MAX);
-
-    // Now at UINT64_MAX again — the gap guard ensures no further applies.
-    // Any u > UINT64_MAX is impossible, so all updates are Stale.
-    auto result4 = book.apply_update(
-        make_update(0, 100, {{500, 300}}, {}));
-    BOOST_TEST((result4 == UpdateResult::Stale));
     BOOST_TEST(book.best_bid()->second == 200);
 }
 
@@ -1050,14 +1048,20 @@ BOOST_AUTO_TEST_CASE(locked_book_no_warning) {
     Snapshot snap{100, {{500, 100}}, {{500, 200}}};
     book.apply_snapshot(snap);
 
-    // Apply an update so the crossed-book check runs.
+    // Capture stderr to verify no warning is emitted.
+    std::ostringstream captured;
+    auto* original = std::cerr.rdbuf(captured.rdbuf());
+
     auto result = book.apply_update(
         make_update(101, 101, {{500, 150}}, {}));
+
+    // Restore stderr before any assertion can fail and skip cleanup.
+    std::cerr.rdbuf(original);
+
     BOOST_TEST((result == UpdateResult::Applied));
     BOOST_TEST(book.best_bid()->first == 500);
     BOOST_TEST(book.best_ask()->first == 500);
-    // No assertion on stderr — the absence of a warning is the test.
-    // A crossed warning would indicate a bug in the >= vs > check.
+    BOOST_TEST(captured.str().find("crossed") == std::string::npos);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
