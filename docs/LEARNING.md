@@ -721,3 +721,61 @@ uint64_t abs_val = negative
 **Pitfalls:**
 - The 1000-event bound at ~1 event/sec gives ~16 minutes of buffering. An unresponsive REST endpoint that takes >16 minutes triggers a resync rather than unbounded memory growth.
 - `deque` allocates in chunks. For 1000 `DepthUpdate` objects (each containing two vectors), peak memory is significant but bounded.
+
+## Phase 2 — Replay, Benchmarking, and Concurrency
+
+### Lock-free programming with atomics
+
+**What:** `std::atomic` provides operations that are guaranteed to be indivisible. Combined with memory ordering constraints, atomics enable lock-free data structures without mutexes.
+
+**Where:** `SpscQueue` in [`src/spsc_queue.hpp`](../src/spsc_queue.hpp) — `head_` and `tail_` are `std::atomic<std::size_t>`.
+
+**Why:** A mutex-based queue adds lock contention overhead. The SPSC queue avoids locks entirely — the producer only writes `tail_`, the consumer only writes `head_`, and they read each other's value with acquire/release ordering.
+
+**How:** The producer stores `tail_` with `memory_order_release` after writing the slot. The consumer loads `tail_` with `memory_order_acquire` before reading the slot. This guarantees the consumer sees the fully constructed element — the slot write "happens before" the `tail_` publish.
+
+```cpp
+// Producer: write slot, then publish tail.
+buf_[tail & mask_] = item;
+tail_.store(tail + 1, std::memory_order_release);
+
+// Consumer: load tail, then read slot.
+auto tail = tail_.load(std::memory_order_acquire);
+if (head == tail) return std::nullopt;
+T item = std::move(buf_[head & mask_]);
+```
+
+**Pitfalls:**
+- `memory_order_relaxed` is safe for a thread reading its own variable (producer reads `tail_`, consumer reads `head_`) because a thread's own writes are always visible to itself.
+- `memory_order_seq_cst` (the default) would be correct but adds unnecessary full fences.
+- False sharing: if `head_` and `tail_` are on the same cache line, writing one invalidates the other thread's cache. `alignas(64)` separates them.
+
+### Cache-line alignment and false sharing
+
+**What:** Modern CPUs transfer memory in cache lines (typically 64 bytes). When two threads write to different variables on the same cache line, each write invalidates the other's cached copy — "false sharing."
+
+**Where:** `SpscQueue::head_` and `SpscQueue::tail_` in [`src/spsc_queue.hpp`](../src/spsc_queue.hpp), each declared `alignas(64)`.
+
+**Why:** Without alignment, the compiler might place `head_` and `tail_` adjacent in memory. The producer's writes to `tail_` would invalidate the consumer's cached `head_`, causing cache-line ping-pong between cores.
+
+**How:** `alignas(64)` forces each atomic to start at a 64-byte boundary, ensuring they occupy separate cache lines.
+
+**Pitfalls:**
+- `alignas(64)` wastes ~120 bytes of padding per queue instance. Irrelevant for one queue.
+- The cache line size varies by architecture. 64 bytes is the safe conservative choice.
+
+### `std::thread` and producer-consumer pattern
+
+**What:** `std::thread` creates an OS thread that runs a callable concurrently with the caller.
+
+**Where:** `replay_pipeline()` in [`src/pipeline.cpp`](../src/pipeline.cpp) — creates a consumer thread.
+
+**Why:** The pipeline splits queuing (producer) from book application (consumer) across two threads. In our benchmark, the bottleneck is `std::map` operations in the consumer, so pipeline throughput matches the sequential baseline.
+
+**How:** The producer pushes all updates, sets `producer_done = true` with release ordering. The consumer checks `producer_done` with acquire ordering to know when to drain and exit.
+
+**Pitfalls:**
+- `std::thread` must be joined or detached before destruction. Failing to join calls `std::terminate`.
+- The consumer accesses `stats` (shared state) — safe because the producer doesn't read `stats` during the consumer's run, and `join()` synchronizes.
+- ThreadSanitizer (TSan) detects data races at runtime. Our pipeline is TSan-clean.
+

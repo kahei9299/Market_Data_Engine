@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(Boost REQUIRED COMPONENTS system json unit_test_framework)
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 
 # --- shared library (non-main sources) ---
 
@@ -19,6 +20,8 @@ add_library(engine_core STATIC
     src/order_book.cpp
     src/http_client.cpp
     src/sync_engine.cpp
+    src/replay.cpp
+    src/pipeline.cpp
 )
 
 target_include_directories(engine_core PUBLIC src)
@@ -29,6 +32,7 @@ target_link_libraries(engine_core
         Boost::json
         OpenSSL::SSL
         OpenSSL::Crypto
+        Threads::Threads
 )
 
 # --- main executable ---
@@ -49,3 +53,20 @@ target_link_libraries(tests
 )
 
 add_test(NAME unit_tests COMMAND tests)
+
+add_executable(tests_phase2 tests/test_phase2.cpp)
+
+target_link_libraries(tests_phase2
+    PRIVATE
+        engine_core
+        Boost::unit_test_framework
+)
+
+add_test(NAME phase2_tests COMMAND tests_phase2)
+
+# --- tools ---
+
+add_executable(generate_data tools/generate_data.cpp)
+
+add_executable(replay_bench tools/replay_bench.cpp)
+target_link_libraries(replay_bench PRIVATE engine_core)
