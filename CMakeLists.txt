@@ -17,6 +17,7 @@ add_library(engine_core STATIC
     src/depth_update.cpp
     src/snapshot.cpp
     src/order_book.cpp
+    src/http_client.cpp
 )
 
 target_include_directories(engine_core PUBLIC src)

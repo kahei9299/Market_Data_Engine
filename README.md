@@ -12,6 +12,7 @@ Built incrementally as a learning project for C++ systems engineering: networkin
 | **M1.2** | Typed depth message parsing | Complete |
 | **M2** | Order book reconstruction | In progress |
 | **M2.1** | Order book data structure | Complete |
+| **M2.2** | Asynchronous HTTPS client | Complete |
 
 ## Architecture
 
@@ -78,9 +79,10 @@ src/
 ├── depth_update.hpp/cpp  DepthUpdate types, strict JSON parser, shared parse helpers
 ├── order_book.hpp/cpp    OrderBook class (bid/ask maps, update procedure, snapshot application)
 ├── snapshot.hpp/cpp      Snapshot type and REST depth response parser
+├── http_client.hpp/cpp   Async HTTPS client (persistent connection, lazy reconnection, TLS verification)
 └── util.hpp/cpp          Timestamp formatting, scaled decimal parser and formatter
 tests/
-└── test_main.cpp         53 unit tests (Boost.Test)
+└── test_main.cpp         103 unit tests (Boost.Test)
 docs/
 ├── DECISIONS.md          Engineering decisions log
 └── LEARNING.md           C++ and systems concepts journal
@@ -123,6 +125,20 @@ GLOSSARY.md               Domain terminology
 - `format_scaled()` utility for converting scaled integers to human-readable decimals
 - Shared `parse_levels()` and `get_uint64()` helpers extracted from M1.2 for reuse
 - 35 new unit tests (90 total)
+
+### M2.2 — Asynchronous HTTPS Client
+
+- `HttpClient` class with async GET via Boost.Beast on the existing `io_context`
+- Persistent HTTP/1.1 connection with lazy reconnection on failure
+- TLS certificate-chain verification, hostname verification (`SSL_set1_host`), and SNI
+- 10-second end-to-end deadline via `net::steady_timer` (configurable for tests)
+- Centralized completion path — exactly one callback per request
+- Overlapping `async_get()` calls rejected with busy error
+- HTTP response body limit (2 MB) via `http::response_parser::body_limit`
+- Connection-close semantics respected for connection reuse decisions
+- Fresh TLS session state on reconnection via stream reconstruction
+- `cancel()` for clean shutdown with explicit cancelled result
+- 9 new deterministic tests using local mock HTTPS server (103 total)
 
 ## Known limitations
 

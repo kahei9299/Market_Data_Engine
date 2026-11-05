@@ -252,3 +252,41 @@ Invalid messages increment `stats_.invalid_messages` and log the error with a tr
 **Selected:** Extracted `parse_levels()` and `get_uint64()` from the anonymous namespace in `depth_update.cpp` to shared declarations in `depth_update.hpp`. `parse_levels` gained a `skip_zero_qty` parameter (default `false`) — depth updates include zero-quantity entries (deletion signals), snapshots skip them (they carry no book state).
 
 **Tradeoff:** Exposes internal parsing functions in the header. Acceptable because the functions are genuinely shared and the alternative is code duplication.
+
+## M2.2 — Asynchronous HTTPS Client
+
+### Deadline enforcement: `net::steady_timer`
+
+**Problem:** Need a hard 10-second wall-clock limit for the entire HTTP request, including DNS resolution, TCP connect, TLS handshake, and HTTP response.
+
+**Options considered:**
+- `beast::tcp_stream::expires_after` — per-operation timeout. Would need resetting at each stage, and total could exceed the intended limit.
+- `net::steady_timer` — fires once at the absolute deadline. On expiry, cancels resolver and closes the socket. Outstanding callbacks fire with errors.
+
+**Selected:** `net::steady_timer` with configurable duration (default 10s). Set once at the start of `async_get()`. On expiry, sets `timed_out_` flag and closes the connection. The cancelled async operation's callback sees the flag and reports "timeout".
+
+**Tradeoff:** The timer fires independently of which async stage is active. The `timed_out_` flag bridges the gap — without it, the error message would be the transport error ("operation aborted") rather than "timeout".
+
+**Revisit if:** Per-stage timeout granularity is needed for diagnostics.
+
+### Connection lifecycle: `std::optional<ssl::stream>` with reconstruction
+
+**Problem:** After a connection failure or server-initiated close, the TLS stream is in a broken state. `ssl::stream` has no `reset()` method. A new connection requires fresh TLS session state.
+
+**Selected:** Store the stream as `std::optional<ssl::stream<beast::tcp_stream>>`. On `close_connection()`, close the socket and reconstruct via `stream_.emplace(ioc_, ssl_ctx_)`. This produces a fresh SSL session for the next connection attempt.
+
+**Rejected:** Storing the stream as a `unique_ptr` — same effect but `optional` avoids the heap allocation.
+
+### Exactly-one completion guarantee
+
+**Problem:** Multiple async operations can be in flight simultaneously (the deadline timer + the current network operation). Both can trigger the completion callback, potentially calling it twice.
+
+**Selected:** `complete()` checks `if (!busy_) return;` and immediately sets `busy_ = false`. The first caller wins; subsequent calls are no-ops. Combined with `timed_out_` for correct error attribution and `cancelling_` for cancellation semantics.
+
+### Overlapping requests: deterministic rejection
+
+**Problem:** Calling `async_get()` while a request is in flight.
+
+**Selected:** Check `busy_` at entry. If true, invoke the callback synchronously with "request already in flight" error. No UB, no queue, no silent drop.
+
+**Revisit if:** SyncEngine needs concurrent snapshot requests (unlikely — sequential retry is the design).

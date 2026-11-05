@@ -633,3 +633,47 @@ uint64_t abs_val = negative
 - Two's complement is guaranteed in C++20 (P0907R4), but signed overflow is still UB. The representation is fixed; the arithmetic rules are not.
 - UBSan catches this at runtime. The test for `format_scaled(-1.5)` would not have triggered it because `-150000000` is far from `INT64_MIN`, but the pattern was still incorrect for the general case.
 - In practice, `format_scaled` is only called with non-negative prices and quantities. The fix is for correctness of the general API contract, not for a current caller.
+
+## M2.2 — Asynchronous HTTPS Client
+
+### `net::steady_timer` for deadline enforcement
+
+**What:** `boost::asio::steady_timer` is an async timer based on `steady_clock`. We use it to enforce a hard wall-clock deadline across the entire HTTP request lifecycle.
+
+**Where:** `HttpClient` in [`src/http_client.hpp`](../src/http_client.hpp) — member `deadline_`. Set in `async_get()`, cancelled in `complete()`, fires `on_deadline()`.
+
+**Why:** An HTTP request spans multiple async stages (resolve, connect, TLS, write, read). Each stage could hang independently. Rather than setting per-stage timeouts that must be coordinated, a single deadline timer fires once and cancels everything.
+
+**How:** At the start of `async_get()`, `deadline_.expires_after(timeout_)` arms the timer. If any stage completes before the deadline, the next stage starts and the timer keeps running. If the deadline fires first, `on_deadline()` sets `timed_out_ = true`, cancels the resolver, and closes the socket. The outstanding async operation's callback fires with an error, checks `timed_out_`, and reports "timeout" to the caller.
+
+**Pitfalls:**
+- The timer and the network operation race. `on_deadline` must not call `complete()` directly — doing so would risk double completion if the cancelled operation's callback also calls `complete()`. Instead, the flag-and-close approach ensures exactly one completion.
+- `deadline_.cancel()` in `complete()` prevents a stale deadline from firing after the request has already finished.
+
+### `std::optional` for reconstructible members
+
+**What:** `std::optional<T>` can be used to hold a member that needs to be destroyed and reconstructed in place, when the type has no `reset()` method.
+
+**Where:** `HttpClient::stream_` is `std::optional<ssl::stream<beast::tcp_stream>>` in [`src/http_client.hpp`](../src/http_client.hpp).
+
+**Why:** After a TLS connection fails or the server closes the connection, `ssl::stream` retains stale TLS session state (session tickets, cipher state). There is no `ssl::stream::reset()` method. To get a clean TLS session for reconnection, we must construct a new stream.
+
+**How:** `close_connection()` in [`src/http_client.cpp`](../src/http_client.cpp) closes the underlying socket, then calls `stream_.emplace(ioc_, ssl_ctx_)` to construct a fresh stream in place. The old stream is destroyed, and the new one has clean TLS state.
+
+**Pitfalls:**
+- `emplace()` destroys the contained object first. If there are outstanding async operations referencing the old stream when `emplace` is called, those operations would use-after-free. This is safe in our design because `close_connection()` closes the socket first, which cancels pending operations — their callbacks fire with errors and do not access the stream.
+- The `ioc_` and `ssl_ctx_` references stored in `HttpClient` exist precisely to support this reconstruction. Without them, we'd need a `unique_ptr` and heap allocation.
+
+### HTTP response parsing with body limit
+
+**What:** Beast's `http::response_parser` enforces a maximum body size at the HTTP protocol level, separate from the underlying buffer size.
+
+**Where:** `HttpClient` uses `std::optional<http::response_parser<http::string_body>>` as `res_parser_` in [`src/http_client.hpp`](../src/http_client.hpp). `body_limit(kMaxBodySize)` is set in `async_get()`.
+
+**Why:** The `beast::flat_buffer` limits total buffer memory, but the HTTP parser has its own default body limit (1 MB for responses). Without setting it explicitly, a legitimate 1.5 MB snapshot response would be rejected by the parser even though the buffer could hold it. We set `body_limit(2 * 1024 * 1024)` explicitly.
+
+**How:** `res_parser_.emplace()` constructs a fresh parser each request. `res_parser_->body_limit(kMaxBodySize)` sets the limit. `http::async_read(*stream_, buffer_, *res_parser_, ...)` reads into the parser, which enforces the limit and returns `http::error::body_limit` if exceeded.
+
+**Pitfalls:**
+- `body_limit` must be set on the parser, not on the response object. Setting it on `http::response` has no effect.
+- The parser is not copyable or movable once reading has started. Using `std::optional` and `emplace()` lets us create a fresh parser for each request.

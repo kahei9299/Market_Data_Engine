@@ -8,6 +8,7 @@
 #include "util.hpp"
 
 #include <boost/beast/core/flat_buffer.hpp>
+#include <boost/beast/http.hpp>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <atomic>
@@ -431,23 +432,7 @@ BOOST_AUTO_TEST_CASE(flat_buffer_respects_max_size) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
-// --- TLS hostname verification (M1.1) ---
-
-BOOST_AUTO_TEST_SUITE(tls)
-
-BOOST_AUTO_TEST_CASE(ssl_set1_host_configures_verification) {
-    ssl::context ctx(ssl::context::tlsv12_client);
-    SSL* handle = SSL_new(ctx.native_handle());
-    BOOST_REQUIRE(handle != nullptr);
-
-    BOOST_TEST(SSL_set_tlsext_host_name(handle, "example.com") == 1);
-    BOOST_TEST(SSL_set1_host(handle, "example.com") == 1);
-
-    X509_VERIFY_PARAM* param = SSL_get0_param(handle);
-    BOOST_REQUIRE(param != nullptr);
-
-    SSL_free(handle);
-}
+// --- TLS test fixtures (shared by M1.1 and M2.2) ---
 
 static constexpr char kTestCert[] = R"(-----BEGIN CERTIFICATE-----
 MIIDNDCCAhygAwIBAgIUM5Nzg/6ZexgbDDGoVaabU8j6oHEwDQYJKoZIhvcNAQEL
@@ -498,6 +483,24 @@ tYbCk+kpZ0FQblj+Ctj5shiAtEwxZxbj7UoXduPJFp+qJZWAaHGu0P8aEcNLNobU
 xEpps7lFh3NB14EIreRcOkoYQkP8Wx0JvsaF7ckii/dGvL9nLCpxBLQqRIGgWl6p
 01RlX7VXAT2ogYGoET1dlyc=
 -----END PRIVATE KEY-----)";
+
+// --- TLS hostname verification (M1.1) ---
+
+BOOST_AUTO_TEST_SUITE(tls)
+
+BOOST_AUTO_TEST_CASE(ssl_set1_host_configures_verification) {
+    ssl::context ctx(ssl::context::tlsv12_client);
+    SSL* handle = SSL_new(ctx.native_handle());
+    BOOST_REQUIRE(handle != nullptr);
+
+    BOOST_TEST(SSL_set_tlsext_host_name(handle, "example.com") == 1);
+    BOOST_TEST(SSL_set1_host(handle, "example.com") == 1);
+
+    X509_VERIFY_PARAM* param = SSL_get0_param(handle);
+    BOOST_REQUIRE(param != nullptr);
+
+    SSL_free(handle);
+}
 
 BOOST_AUTO_TEST_CASE(hostname_mismatch_rejected_by_local_server) {
     net::io_context ioc;
@@ -1062,6 +1065,422 @@ BOOST_AUTO_TEST_CASE(locked_book_no_warning) {
     BOOST_TEST(book.best_bid()->first == 500);
     BOOST_TEST(book.best_ask()->first == 500);
     BOOST_TEST(captured.str().find("crossed") == std::string::npos);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// --- HttpClient tests (M2.2) ---
+
+#include "http_client.hpp"
+
+BOOST_AUTO_TEST_SUITE(http_client)
+
+namespace http = boost::beast::http;
+
+// Helper: set up a mock HTTPS server on localhost with a random port.
+// Returns false (and skips the test) if local port binding is unavailable.
+struct MockServer {
+    net::io_context& ioc;
+    ssl::context server_ctx{ssl::context::tlsv12_server};
+    tcp::acceptor acceptor;
+    std::string port;
+    bool available = false;
+
+    explicit MockServer(net::io_context& ioc_) : ioc(ioc_), acceptor(ioc_) {
+        server_ctx.use_certificate_chain(
+            net::buffer(kTestCert, std::strlen(kTestCert)));
+        server_ctx.use_private_key(
+            net::buffer(kTestKey, std::strlen(kTestKey)), ssl::context::pem);
+
+        beast::error_code ec;
+        acceptor.open(tcp::v4(), ec);
+        if (ec) return;
+        acceptor.set_option(net::socket_base::reuse_address(true), ec);
+        if (ec) return;
+        acceptor.bind(tcp::endpoint(net::ip::make_address("127.0.0.1"), 0), ec);
+        if (ec) return;
+        acceptor.listen(4, ec);
+        if (ec) return;
+        port = std::to_string(acceptor.local_endpoint().port());
+        available = true;
+    }
+
+    // Accept one connection and serve a canned response after reading
+    // the HTTP request. keep_alive controls the Connection header.
+    void serve(std::string body, unsigned status = 200,
+               bool keep_alive = true) {
+        auto server_stream =
+            std::make_shared<ssl::stream<tcp::socket>>(ioc, server_ctx);
+        acceptor.async_accept(server_stream->next_layer(),
+            [server_stream, body = std::move(body), status, keep_alive]
+            (beast::error_code ec) mutable {
+                if (ec) return;
+                server_stream->async_handshake(ssl::stream_base::server,
+                    [server_stream, body = std::move(body), status, keep_alive]
+                    (beast::error_code ec) mutable {
+                        if (ec) return;
+                        auto req = std::make_shared<
+                            http::request<http::string_body>>();
+                        auto buf = std::make_shared<beast::flat_buffer>();
+                        http::async_read(*server_stream, *buf, *req,
+                            [server_stream, req, buf,
+                             body = std::move(body), status, keep_alive]
+                            (beast::error_code ec, std::size_t) mutable {
+                                if (ec) return;
+                                auto res = std::make_shared<
+                                    http::response<http::string_body>>();
+                                res->result(status);
+                                res->version(11);
+                                res->set(http::field::content_type,
+                                         "application/json");
+                                res->keep_alive(keep_alive);
+                                res->body() = std::move(body);
+                                res->prepare_payload();
+                                http::async_write(*server_stream, *res,
+                                    [server_stream, res, keep_alive]
+                                    (beast::error_code, std::size_t) {
+                                        if (!keep_alive) {
+                                            beast::error_code ec;
+                                            server_stream->next_layer()
+                                                .close(ec);
+                                        }
+                                    });
+                            });
+                    });
+            });
+    }
+
+    ssl::context make_client_ctx() {
+        ssl::context ctx(ssl::context::tlsv12_client);
+        ctx.add_certificate_authority(
+            net::buffer(kTestCert, std::strlen(kTestCert)));
+        ctx.set_verify_mode(ssl::verify_peer);
+        return ctx;
+    }
+};
+
+BOOST_AUTO_TEST_CASE(successful_get_returns_body) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    std::string response_body = R"({"lastUpdateId":100,"bids":[],"asks":[]})";
+    srv.serve(response_body);
+
+    HttpClient::Result got;
+    auto client = std::make_shared<HttpClient>(
+        ioc, ctx, "testserver.local", srv.port);
+    client->async_get("/api/v3/depth", [&got](auto r) { got = std::move(r); });
+
+    ioc.run();
+
+    auto* resp = std::get_if<HttpClient::Response>(&got);
+    BOOST_REQUIRE(resp != nullptr);
+    BOOST_TEST(resp->status == 200u);
+    BOOST_TEST(resp->body == response_body);
+}
+
+BOOST_AUTO_TEST_CASE(non_200_status_returned) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    srv.serve(R"({"code":-1003,"msg":"Too many requests."})", 429);
+
+    HttpClient::Result got;
+    auto client = std::make_shared<HttpClient>(
+        ioc, ctx, "testserver.local", srv.port);
+    client->async_get("/api/v3/depth", [&got](auto r) { got = std::move(r); });
+
+    ioc.run();
+
+    auto* resp = std::get_if<HttpClient::Response>(&got);
+    BOOST_REQUIRE(resp != nullptr);
+    BOOST_TEST(resp->status == 429u);
+}
+
+BOOST_AUTO_TEST_CASE(connection_reuse_second_request) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Server accepts one connection, serves two requests.
+    auto server_stream =
+        std::make_shared<ssl::stream<tcp::socket>>(ioc, srv.server_ctx);
+    srv.acceptor.async_accept(server_stream->next_layer(),
+        [server_stream](beast::error_code ec) {
+            if (ec) return;
+            server_stream->async_handshake(ssl::stream_base::server,
+                [server_stream](beast::error_code ec) {
+                    if (ec) return;
+                    // Read+respond to first request.
+                    auto req1 = std::make_shared<
+                        http::request<http::string_body>>();
+                    auto buf = std::make_shared<beast::flat_buffer>();
+                    http::async_read(*server_stream, *buf, *req1,
+                        [server_stream, req1, buf](beast::error_code ec,
+                                                    std::size_t) {
+                            if (ec) return;
+                            auto res1 = std::make_shared<
+                                http::response<http::string_body>>();
+                            res1->result(200);
+                            res1->version(11);
+                            res1->keep_alive(true);
+                            res1->body() = "first";
+                            res1->prepare_payload();
+                            http::async_write(*server_stream, *res1,
+                                [server_stream, res1, buf]
+                                (beast::error_code ec, std::size_t) {
+                                    if (ec) return;
+                                    buf->consume(buf->size());
+                                    // Read+respond to second request.
+                                    auto req2 = std::make_shared<
+                                        http::request<http::string_body>>();
+                                    http::async_read(*server_stream, *buf,
+                                        *req2,
+                                        [server_stream, req2, buf]
+                                        (beast::error_code ec, std::size_t) {
+                                            if (ec) return;
+                                            auto res2 = std::make_shared<
+                                                http::response<
+                                                    http::string_body>>();
+                                            res2->result(200);
+                                            res2->version(11);
+                                            res2->keep_alive(true);
+                                            res2->body() = "second";
+                                            res2->prepare_payload();
+                                            http::async_write(*server_stream,
+                                                *res2,
+                                                [server_stream, res2]
+                                                (beast::error_code, std::size_t)
+                                                {});
+                                        });
+                                });
+                        });
+                });
+        });
+
+    std::string body1, body2;
+    auto client = std::make_shared<HttpClient>(
+        ioc, ctx, "testserver.local", srv.port);
+
+    client->async_get("/first", [&](auto r) {
+        auto* resp = std::get_if<HttpClient::Response>(&r);
+        if (resp) body1 = resp->body;
+        // Issue second request from the first's callback.
+        client->async_get("/second", [&](auto r2) {
+            auto* resp2 = std::get_if<HttpClient::Response>(&r2);
+            if (resp2) body2 = resp2->body;
+        });
+    });
+
+    ioc.run();
+
+    BOOST_TEST(body1 == "first");
+    BOOST_TEST(body2 == "second");
+}
+
+BOOST_AUTO_TEST_CASE(connection_failure_reports_error) {
+    net::io_context ioc;
+    ssl::context ctx(ssl::context::tlsv12_client);
+    ctx.set_verify_mode(ssl::verify_peer);
+
+    HttpClient::Result got;
+    // Port 1 — nothing is listening there.
+    auto client = std::make_shared<HttpClient>(
+        ioc, ctx, "127.0.0.1", "1");
+    client->async_get("/test", [&got](auto r) { got = std::move(r); });
+
+    ioc.run();
+
+    auto* err = std::get_if<std::string>(&got);
+    BOOST_REQUIRE(err != nullptr);
+    BOOST_TEST(err->find("connect:") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(cancel_delivers_cancelled_result) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Server accepts but never responds — client will hang until cancelled.
+    auto server_stream =
+        std::make_shared<ssl::stream<tcp::socket>>(ioc, srv.server_ctx);
+    srv.acceptor.async_accept(server_stream->next_layer(),
+        [server_stream](beast::error_code ec) {
+            if (ec) return;
+            server_stream->async_handshake(ssl::stream_base::server,
+                [](beast::error_code) {});
+        });
+
+    HttpClient::Result got;
+    bool callback_fired = false;
+    auto client = std::make_shared<HttpClient>(
+        ioc, ctx, "testserver.local", srv.port);
+    client->async_get("/hang", [&](auto r) {
+        callback_fired = true;
+        got = std::move(r);
+    });
+
+    // Post cancel — runs after pending handlers get a chance to start.
+    net::post(ioc, [&client]() { client->cancel(); });
+
+    ioc.run();
+
+    BOOST_TEST(callback_fired);
+    auto* err = std::get_if<std::string>(&got);
+    BOOST_REQUIRE(err != nullptr);
+}
+
+BOOST_AUTO_TEST_CASE(timeout_fires_on_unresponsive_server) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Server accepts TLS but never sends a response.
+    auto server_stream =
+        std::make_shared<ssl::stream<tcp::socket>>(ioc, srv.server_ctx);
+    srv.acceptor.async_accept(server_stream->next_layer(),
+        [server_stream](beast::error_code ec) {
+            if (ec) return;
+            server_stream->async_handshake(ssl::stream_base::server,
+                [](beast::error_code) {});
+        });
+
+    HttpClient::Result got;
+    // 100ms timeout for test speed.
+    auto client = std::make_shared<HttpClient>(
+        ioc, ctx, "testserver.local", srv.port,
+        std::chrono::milliseconds(100));
+    client->async_get("/slow", [&got](auto r) { got = std::move(r); });
+
+    ioc.run();
+
+    auto* err = std::get_if<std::string>(&got);
+    BOOST_REQUIRE(err != nullptr);
+    BOOST_TEST(*err == "timeout");
+}
+
+BOOST_AUTO_TEST_CASE(tls_hostname_mismatch_rejected) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Server accepts connections normally.
+    srv.serve("should not arrive");
+
+    HttpClient::Result got;
+    // Use "localhost" which does not match cert SAN "testserver.local".
+    auto client = std::make_shared<HttpClient>(
+        ioc, ctx, "localhost", srv.port);
+    client->async_get("/test", [&got](auto r) { got = std::move(r); });
+
+    ioc.run();
+
+    auto* err = std::get_if<std::string>(&got);
+    BOOST_REQUIRE(err != nullptr);
+    BOOST_TEST(err->find("tls_handshake:") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(stale_connection_recovery) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // First request: server responds then closes the connection.
+    srv.serve("first", 200, false); // keep_alive = false
+
+    std::string body1;
+    HttpClient::Result got2;
+    auto client = std::make_shared<HttpClient>(
+        ioc, ctx, "testserver.local", srv.port);
+
+    client->async_get("/first", [&](auto r) {
+        auto* resp = std::get_if<HttpClient::Response>(&r);
+        if (resp) body1 = resp->body;
+
+        // Second request: server serves on a new connection.
+        srv.serve("second", 200, true);
+        client->async_get("/second", [&got2](auto r2) {
+            got2 = std::move(r2);
+        });
+    });
+
+    ioc.run();
+
+    BOOST_TEST(body1 == "first");
+    auto* resp2 = std::get_if<HttpClient::Response>(&got2);
+    BOOST_REQUIRE(resp2 != nullptr);
+    BOOST_TEST(resp2->body == "second");
+}
+
+BOOST_AUTO_TEST_CASE(overlapping_request_rejected) {
+    net::io_context ioc;
+    MockServer srv(ioc);
+    if (!srv.available) {
+        BOOST_WARN_MESSAGE(false, "skipped: cannot bind");
+        return;
+    }
+    auto ctx = srv.make_client_ctx();
+
+    // Server accepts but never responds — first request stays in flight.
+    auto server_stream =
+        std::make_shared<ssl::stream<tcp::socket>>(ioc, srv.server_ctx);
+    srv.acceptor.async_accept(server_stream->next_layer(),
+        [server_stream](beast::error_code ec) {
+            if (ec) return;
+            server_stream->async_handshake(ssl::stream_base::server,
+                [](beast::error_code) {});
+        });
+
+    auto client = std::make_shared<HttpClient>(
+        ioc, ctx, "testserver.local", srv.port,
+        std::chrono::milliseconds(200));
+
+    HttpClient::Result overlap_result;
+    client->async_get("/first", [](auto) {});
+
+    // Immediately try a second request while first is in flight.
+    client->async_get("/second", [&overlap_result](auto r) {
+        overlap_result = std::move(r);
+    });
+
+    // The second callback fires synchronously with a busy error.
+    auto* err = std::get_if<std::string>(&overlap_result);
+    BOOST_REQUIRE(err != nullptr);
+    BOOST_TEST(*err == "request already in flight");
+
+    // Let the first request time out so ioc.run() completes.
+    client->cancel();
+    ioc.run();
 }
 
 BOOST_AUTO_TEST_SUITE_END()
