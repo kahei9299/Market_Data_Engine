@@ -2105,9 +2105,9 @@ BOOST_AUTO_TEST_CASE(tls_verified_local_https) {
 }
 
 BOOST_AUTO_TEST_CASE(resync_recovery_after_inflight_abort) {
-    // Reproduce: buffer overflow while snapshot is in flight (server hangs).
-    // After resync, the next event must successfully trigger a new snapshot
-    // without waiting for the old request's timeout.
+    // Reproduce: buffer overflow while the first snapshot request has
+    // genuinely reached the server (TLS handshake + HTTP request read).
+    // After resync + abort, a fresh snapshot succeeds immediately.
     net::io_context ioc;
     MockServer srv(ioc);
     if (!srv.available) {
@@ -2116,24 +2116,40 @@ BOOST_AUTO_TEST_CASE(resync_recovery_after_inflight_abort) {
     }
     auto ctx = srv.make_client_ctx();
 
-    // First snapshot: server accepts TLS but never responds.
+    // Server completes TLS and reads the HTTP request but never responds.
+    bool request_received = false;
     auto ss = std::make_shared<ssl::stream<tcp::socket>>(ioc, srv.server_ctx);
+    auto sbuf = std::make_shared<beast::flat_buffer>();
+    auto sreq = std::make_shared<http::request<http::string_body>>();
     srv.acceptor.async_accept(ss->next_layer(),
-        [ss](beast::error_code ec) {
+        [ss, sbuf, sreq, &request_received](beast::error_code ec) {
             if (ec) return;
             ss->async_handshake(ssl::stream_base::server,
-                [](beast::error_code) {});
+                [ss, sbuf, sreq, &request_received](beast::error_code ec) {
+                    if (ec) return;
+                    http::async_read(*ss, *sbuf, *sreq,
+                        [&request_received](beast::error_code ec, std::size_t) {
+                            if (!ec) request_received = true;
+                        });
+                });
         });
 
     auto cfg = mock_config(srv.port);
     cfg.http_timeout = std::chrono::seconds(5);
     auto eng = std::make_shared<SyncEngine>(ioc, ctx, cfg);
 
-    // First event triggers snapshot request (hangs).
+    // First event triggers snapshot request.
     eng->on_update(make_depth(101, 102));
     BOOST_TEST((eng->state() == SyncState::SnapshotPending));
 
-    // Fill buffer to overflow → resync. This calls abort() on HttpClient.
+    // Run until the server has received the HTTP request.
+    while (!request_received)
+        ioc.run_one();
+
+    BOOST_TEST(request_received);
+
+    // Now the client's async_read is pending on the server's response.
+    // Fill buffer to overflow → resync + abort().
     for (std::size_t i = 1; i < SyncEngine::kMaxBufferSize; ++i) {
         eng->on_update(make_depth(102 + i, 102 + i));
     }
@@ -2141,11 +2157,11 @@ BOOST_AUTO_TEST_CASE(resync_recovery_after_inflight_abort) {
     BOOST_TEST((ev == SyncEvent::Resyncing));
     BOOST_TEST((eng->state() == SyncState::Buffering));
 
-    // Close the hung server connection so it doesn't block ioc.run().
+    // Close the hung first server connection.
     srv.acceptor.close();
     { beast::error_code ec; ss->next_layer().close(ec); }
 
-    // Re-open acceptor and serve a fresh snapshot for the new sync cycle.
+    // Re-open acceptor and serve a fresh snapshot.
     {
         beast::error_code ec;
         srv.acceptor.open(tcp::v4(), ec);
@@ -2156,13 +2172,13 @@ BOOST_AUTO_TEST_CASE(resync_recovery_after_inflight_abort) {
     }
     srv.serve(snapshot_json(301, R"([["60.0","5.0"]])", R"([["61.0","3.0"]])"));
 
-    // New first event triggers new snapshot — should succeed immediately.
+    // New first event → new snapshot request on a fresh Conn.
     eng->on_update(make_depth(301, 302, {{5900000000, 100000000}}, {}));
     BOOST_TEST((eng->state() == SyncState::SnapshotPending));
 
     ioc.run();
 
-    // Should synchronize without waiting for the 5-second old timeout.
+    // Synchronized without waiting for the 5-second old timeout.
     BOOST_TEST((eng->state() == SyncState::Synchronized));
     BOOST_TEST(eng->book().update_id() == 302u);
     BOOST_TEST(eng->book().bid_count() == 2u);

@@ -11,8 +11,7 @@ HttpClient::HttpClient(net::io_context& ioc, ssl::context& ctx,
     : ioc_(ioc),
       ssl_ctx_(ctx),
       resolver_(ioc),
-      stream_(std::in_place, ioc, ctx),
-      deadline_(ioc),
+      conn_(std::make_shared<Conn>(ioc, ctx)),
       connect_host_(std::move(connect_host)),
       connect_port_(std::move(connect_port)),
       tls_host_(std::move(tls_host)),
@@ -35,28 +34,32 @@ void HttpClient::async_get(std::string target, Callback cb) {
     auto gen = ++request_gen_;
     cb_ = std::move(cb);
 
-    req_ = {};
-    req_.method(http::verb::get);
-    req_.target(target);
-    req_.set(http::field::host, tls_host_);
-    req_.set(http::field::user_agent, "market-data-engine/0.2");
-    req_.version(11);
+    // Create fresh Conn if previous was closed or aborted.
+    if (!conn_ || !conn_->connected)
+        conn_ = std::make_shared<Conn>(ioc_, ssl_ctx_);
 
-    buffer_.consume(buffer_.size());
-    res_parser_.emplace();
-    res_parser_->body_limit(kMaxBodySize);
+    auto c = conn_;
+    c->req = {};
+    c->req.method(http::verb::get);
+    c->req.target(target);
+    c->req.set(http::field::host, tls_host_);
+    c->req.set(http::field::user_agent, "market-data-engine/0.2");
+    c->req.version(11);
 
-    deadline_.expires_after(timeout_);
-    deadline_.async_wait(
-        [self = shared_from_this(), gen](beast::error_code ec) {
-            self->on_deadline(gen, ec);
+    c->buffer.consume(c->buffer.size());
+    c->parser.emplace();
+    c->parser->body_limit(kMaxBodySize);
+
+    c->deadline.expires_after(timeout_);
+    c->deadline.async_wait(
+        [self = shared_from_this(), c, gen](beast::error_code ec) {
+            self->on_deadline(c, gen, ec);
         });
 
-    if (connected_) {
-        do_request(gen);
+    if (c->connected) {
+        do_request(c, gen);
     } else {
-        ensure_fresh_stream();
-        do_resolve(gen);
+        do_resolve(c, gen);
     }
 }
 
@@ -64,24 +67,30 @@ void HttpClient::cancel() {
     if (cancelling_)
         return;
     cancelling_ = true;
-    deadline_.cancel();
+    if (conn_) {
+        conn_->deadline.cancel();
+        beast::error_code ec;
+        beast::get_lowest_layer(conn_->stream).socket().close(ec);
+        conn_->connected = false;
+    }
     resolver_.cancel();
-    close_socket();
 }
 
 void HttpClient::abort() {
     cancel();
-    // Invalidate the current request gen so stale callbacks are ignored,
-    // then clear busy so a new request can be accepted immediately.
     ++request_gen_;
     busy_ = false;
     cb_ = nullptr;
+    // Drop reference to old Conn. It stays alive in any pending callbacks
+    // until they fire and see the stale gen.
+    conn_.reset();
 }
 
 void HttpClient::complete(Result result, uint64_t gen) {
     if (!busy_ || gen != request_gen_)
         return;
-    deadline_.cancel();
+    if (conn_)
+        conn_->deadline.cancel();
     busy_ = false;
     if (cb_) {
         auto cb = std::move(cb_);
@@ -90,30 +99,17 @@ void HttpClient::complete(Result result, uint64_t gen) {
     }
 }
 
-void HttpClient::close_socket() {
-    if (stream_) {
-        beast::error_code ec;
-        beast::get_lowest_layer(*stream_).socket().close(ec);
-    }
-    connected_ = false;
-}
-
-void HttpClient::ensure_fresh_stream() {
-    if (!connected_) {
-        stream_.emplace(ioc_, ssl_ctx_);
-    }
-}
-
-void HttpClient::do_resolve(uint64_t gen) {
+void HttpClient::do_resolve(std::shared_ptr<Conn> c, uint64_t gen) {
     resolver_.async_resolve(
         connect_host_, connect_port_,
-        [self = shared_from_this(), gen](beast::error_code ec,
-                                         tcp::resolver::results_type results) {
-            self->on_resolve(gen, ec, std::move(results));
+        [self = shared_from_this(), c, gen](
+            beast::error_code ec, tcp::resolver::results_type results) {
+            self->on_resolve(c, gen, ec, std::move(results));
         });
 }
 
-void HttpClient::on_resolve(uint64_t gen, beast::error_code ec,
+void HttpClient::on_resolve(std::shared_ptr<Conn> c, uint64_t gen,
+                            beast::error_code ec,
                             tcp::resolver::results_type results) {
     if (gen != request_gen_) return;
     if (cancelling_)
@@ -123,15 +119,17 @@ void HttpClient::on_resolve(uint64_t gen, beast::error_code ec,
                                    : std::string("resolve: " + ec.message()),
                         gen);
 
-    beast::get_lowest_layer(*stream_).async_connect(
+    beast::get_lowest_layer(c->stream).async_connect(
         results,
-        [self = shared_from_this(), gen](beast::error_code ec,
-                                         tcp::resolver::results_type::endpoint_type ep) {
-            self->on_connect(gen, ec, ep);
+        [self = shared_from_this(), c, gen](
+            beast::error_code ec,
+            tcp::resolver::results_type::endpoint_type ep) {
+            self->on_connect(c, gen, ec, ep);
         });
 }
 
-void HttpClient::on_connect(uint64_t gen, beast::error_code ec,
+void HttpClient::on_connect(std::shared_ptr<Conn> c, uint64_t gen,
+                            beast::error_code ec,
                             tcp::resolver::results_type::endpoint_type) {
     if (gen != request_gen_) return;
     if (cancelling_)
@@ -141,87 +139,95 @@ void HttpClient::on_connect(uint64_t gen, beast::error_code ec,
                                    : std::string("connect: " + ec.message()),
                         gen);
 
-    auto* ssl_handle = stream_->native_handle();
+    auto* ssl_handle = c->stream.native_handle();
     if (!SSL_set_tlsext_host_name(ssl_handle, tls_host_.c_str())) {
-        close_socket();
+        c->connected = false;
         return complete(std::string("ssl_set_host_name failed"), gen);
     }
     if (!SSL_set1_host(ssl_handle, tls_host_.c_str())) {
-        close_socket();
+        c->connected = false;
         return complete(std::string("ssl_set1_host failed"), gen);
     }
 
-    stream_->async_handshake(
+    c->stream.async_handshake(
         ssl::stream_base::client,
-        [self = shared_from_this(), gen](beast::error_code ec) {
-            self->on_tls_handshake(gen, ec);
+        [self = shared_from_this(), c, gen](beast::error_code ec) {
+            self->on_tls_handshake(c, gen, ec);
         });
 }
 
-void HttpClient::on_tls_handshake(uint64_t gen, beast::error_code ec) {
+void HttpClient::on_tls_handshake(std::shared_ptr<Conn> c, uint64_t gen,
+                                  beast::error_code ec) {
     if (gen != request_gen_) return;
     if (cancelling_)
         return complete(std::string("cancelled"), gen);
     if (ec) {
-        close_socket();
+        c->connected = false;
         return complete(timed_out_ ? std::string("timeout")
                                    : std::string("tls_handshake: " + ec.message()),
                         gen);
     }
 
-    connected_ = true;
-    do_request(gen);
+    c->connected = true;
+    do_request(c, gen);
 }
 
-void HttpClient::do_request(uint64_t gen) {
+void HttpClient::do_request(std::shared_ptr<Conn> c, uint64_t gen) {
     http::async_write(
-        *stream_, req_,
-        [self = shared_from_this(), gen](beast::error_code ec, std::size_t bytes) {
-            self->on_write(gen, ec, bytes);
+        c->stream, c->req,
+        [self = shared_from_this(), c, gen](
+            beast::error_code ec, std::size_t bytes) {
+            self->on_write(c, gen, ec, bytes);
         });
 }
 
-void HttpClient::on_write(uint64_t gen, beast::error_code ec, std::size_t) {
+void HttpClient::on_write(std::shared_ptr<Conn> c, uint64_t gen,
+                          beast::error_code ec, std::size_t) {
     if (gen != request_gen_) return;
     if (cancelling_)
         return complete(std::string("cancelled"), gen);
     if (ec) {
-        close_socket();
+        c->connected = false;
         return complete(timed_out_ ? std::string("timeout")
                                    : std::string("write: " + ec.message()),
                         gen);
     }
 
     http::async_read(
-        *stream_, buffer_, *res_parser_,
-        [self = shared_from_this(), gen](beast::error_code ec, std::size_t bytes) {
-            self->on_read(gen, ec, bytes);
+        c->stream, c->buffer, *c->parser,
+        [self = shared_from_this(), c, gen](
+            beast::error_code ec, std::size_t bytes) {
+            self->on_read(c, gen, ec, bytes);
         });
 }
 
-void HttpClient::on_read(uint64_t gen, beast::error_code ec, std::size_t) {
+void HttpClient::on_read(std::shared_ptr<Conn> c, uint64_t gen,
+                         beast::error_code ec, std::size_t) {
     if (gen != request_gen_) return;
     if (cancelling_)
         return complete(std::string("cancelled"), gen);
     if (ec) {
-        close_socket();
+        c->connected = false;
         return complete(timed_out_ ? std::string("timeout")
                                    : std::string("read: " + ec.message()),
                         gen);
     }
 
-    auto& msg = res_parser_->get();
+    auto& msg = c->parser->get();
 
     if (msg.need_eof() || !msg.keep_alive())
-        close_socket();
+        c->connected = false;
 
     complete(Response{msg.result_int(), std::move(msg.body())}, gen);
 }
 
-void HttpClient::on_deadline(uint64_t gen, beast::error_code ec) {
+void HttpClient::on_deadline(std::shared_ptr<Conn> c, uint64_t gen,
+                             beast::error_code ec) {
     if (ec == net::error::operation_aborted || gen != request_gen_)
         return;
     timed_out_ = true;
     resolver_.cancel();
-    close_socket();
+    beast::error_code close_ec;
+    beast::get_lowest_layer(c->stream).socket().close(close_ec);
+    c->connected = false;
 }
