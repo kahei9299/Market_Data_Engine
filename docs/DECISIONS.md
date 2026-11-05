@@ -318,3 +318,32 @@ Invalid messages increment `stats_.invalid_messages` and log the error with a tr
 **Problem:** Session needs to know the outcome of `on_update()` to decide what to print.
 
 **Selected:** `on_update()` returns `SyncEvent` enum: Applied, Stale, Buffered, Synchronized, Resyncing. Session prints best bid/ask only on Applied or Synchronized, ignoring stale and buffered events.
+
+## Phase 2 — Replay, Benchmarking, and Concurrency
+
+### Lock-free SPSC ring buffer
+
+**Problem:** The producer-consumer pipeline needs a bounded queue between the producer thread (pushes depth updates) and the consumer thread (applies to order book).
+
+**Options considered:**
+- `std::mutex` + `std::queue` — simple, correct, but lock contention adds latency.
+- Lock-free SPSC ring buffer — no locks, cache-friendly, minimal overhead for the single-producer single-consumer case.
+- Lock-free MPMC queue — unnecessary complexity for one producer, one consumer.
+
+**Selected:** Lock-free SPSC ring buffer with power-of-two capacity, atomic head/tail with release/acquire ordering, and cache-line-aligned indices to prevent false sharing. The simplest lock-free queue that fits our exactly-one-producer, exactly-one-consumer model.
+
+**Tradeoff:** Busy-wait spin when the queue is full or empty. Acceptable for benchmarking; production use would want yield/sleep backoff.
+
+### Single-writer order book in pipeline
+
+**Problem:** The OrderBook uses `std::map` which is not thread-safe. Multiple threads applying updates would require synchronization.
+
+**Selected:** The consumer thread is the sole writer to the OrderBook. The producer thread only pushes updates into the queue. No locks needed on the book itself.
+
+### Custom benchmark harness vs Google Benchmark
+
+**Problem:** Need reproducible throughput and latency measurements.
+
+**Selected:** Custom harness using `std::chrono::steady_clock`. Measures per-message latency with percentile computation. Simpler than adding a Google Benchmark dependency for the measurements we need.
+
+**Revisit if:** More sophisticated benchmarking is needed (warm-up, statistical analysis, CSV export).

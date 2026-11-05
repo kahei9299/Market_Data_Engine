@@ -15,6 +15,7 @@ Built incrementally as a learning project for C++ systems engineering: networkin
 | **M2.2** | Asynchronous HTTPS client | Complete |
 | **M2.3** | Synchronization engine | Complete |
 | **M2.4** | Session integration | Complete |
+| **Phase 2** | Replay, benchmarking, concurrency | Complete |
 
 ## Architecture
 
@@ -83,9 +84,17 @@ src/
 ├── snapshot.hpp/cpp      Snapshot type and REST depth response parser
 ├── http_client.hpp/cpp   Async HTTPS client (persistent connection, lazy reconnection, TLS verification)
 ├── sync_engine.hpp/cpp   Snapshot sync state machine (buffering, retry, gap detection)
+├── replay.hpp/cpp        Deterministic offline replay engine
+├── spsc_queue.hpp        Lock-free SPSC ring buffer (header-only)
+├── pipeline.hpp/cpp      Producer-consumer pipeline using SPSC queue
 └── util.hpp/cpp          Timestamp formatting, scaled decimal parser and formatter
+tools/
+├── generate_data.cpp     Synthetic depth update generator
+└── replay_bench.cpp      Benchmark executable (parse, replay, pipeline)
 tests/
-└── test_main.cpp         114 unit tests (Boost.Test)
+├── test_main.cpp         123 unit tests (Boost.Test) — M1/M2
+└── test_phase2.cpp       15 unit tests — replay, SPSC queue, pipeline (138 total)
+data/                     Generated test data (gitignored)
 docs/
 ├── DECISIONS.md          Engineering decisions log
 └── LEARNING.md           C++ and systems concepts journal
@@ -157,6 +166,43 @@ GLOSSARY.md               Domain terminology
 - Graceful shutdown via `SyncEngine::stop()` cancelling HTTP requests and timers
 - 11 new deterministic tests with mock HTTPS server (114 total)
 
+### Phase 2 — Replay, Benchmarking, and Concurrency
+
+**Deterministic replay:**
+- Offline replay from JSONL files (one depth update JSON per line)
+- Reuses existing parser and OrderBook — no logic duplication
+- Tracks applied, stale, gap, and parse error counts
+- Deterministic: identical input produces identical book state
+
+**Benchmarking:**
+- Custom benchmark harness measuring parse throughput, sequential replay latency, and pipeline throughput
+- Per-message latency with p50/p95/p99/max percentiles
+- Release-build optimized measurements
+
+**Measured results (Apple M4 Pro, macOS, Release build, 100k synthetic messages):**
+
+| Metric | Value |
+|---|---|
+| Parse throughput | ~835k msg/s |
+| Sequential replay throughput | ~110k msg/s |
+| Sequential p50 latency | ~8.8 µs |
+| Sequential p95 latency | ~11 µs |
+| Sequential p99 latency | ~13.6 µs |
+| Pipeline throughput (queue=4096) | ~110k msg/s |
+
+**Lock-free SPSC queue:**
+- Power-of-two ring buffer with atomic head/tail
+- Cache-line-aligned (64 bytes) to avoid false sharing
+- Release/acquire memory ordering
+- `try_push` / `try_pop` — no blocking, no allocation
+
+**Producer-consumer pipeline:**
+- Producer thread pushes parsed DepthUpdates into SPSC queue
+- Consumer thread pops and applies to OrderBook (single writer)
+- Busy-wait spin on backpressure (queue full) and starvation (queue empty)
+- Verified: pipeline produces identical book state as sequential replay
+- ThreadSanitizer clean
+
 ## Known limitations
 
 - No reconnection on WebSocket disconnect — process exits on connection error
@@ -166,6 +212,10 @@ GLOSSARY.md               Domain terminology
 - `timestamp_now()` uses `gmtime_r` (POSIX) — not portable to Windows
 - Namespace aliases in `session.hpp` leak into includers
 - Hostname mismatch integration test requires local port binding (skipped in sandboxed environments)
+- Pipeline throughput matches sequential because the bottleneck is `std::map` operations on a ~10k-level book, not inter-thread communication
+- Busy-wait spin in pipeline consumes CPU when producer outpaces consumer
+- Benchmark results are environment-specific (Apple M4 Pro); results will vary by hardware
+- No NUMA-aware allocation
 
 ## Dependencies
 
