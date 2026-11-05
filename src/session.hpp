@@ -1,5 +1,7 @@
 #pragma once
 
+#include "sync_engine.hpp"
+
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
@@ -48,11 +50,13 @@ class Session : public std::enable_shared_from_this<Session> {
 
     ErrorCallback on_error_;
     SessionStats stats_;
+    std::shared_ptr<SyncEngine> sync_engine_;
 
   public:
     Session(net::io_context& ioc, ssl::context& ctx,
             std::string host, std::string port, std::string path,
-            ErrorCallback on_error = {});
+            ErrorCallback on_error = {},
+            SyncEngine::Config sync_config = {});
 
     void run();
     void stop();
