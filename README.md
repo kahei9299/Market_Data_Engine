@@ -56,8 +56,10 @@ ninja -C build
 # Run live receiver (Ctrl-C to stop)
 ./build/market-data-engine
 
-# Record live data for offline replay
-MARKET_DATA_RAW=1 timeout 60 ./build/market-data-engine 2>/dev/null > data/live.jsonl
+# Record live data for offline replay (Ctrl-C to stop)
+MARKET_DATA_RAW=1 ./build/market-data-engine 2>/dev/null > data/live.jsonl
+# Or with a time limit (requires GNU coreutils: brew install coreutils)
+# gtimeout 60 env MARKET_DATA_RAW=1 ./build/market-data-engine 2>/dev/null > data/live.jsonl
 
 # Generate synthetic test data
 ./build/generate_data 100000 data/depth_100k.jsonl
@@ -101,8 +103,8 @@ tools/
 ├── generate_data.cpp     Synthetic depth update generator
 └── replay_bench.cpp      Benchmark harness (parse, replay, pipeline)
 tests/
-├── test_main.cpp         143 tests: parsing, order book, networking, sync
-└── test_phase2.cpp       20 tests: SPSC queue, replay, pipeline correctness
+├── test_main.cpp         123 M1/M2 tests: parsing, order book, networking, sync
+└── test_phase2.cpp       20 Phase 2 tests: SPSC queue, replay, pipeline correctness
 docs/
 ├── DECISIONS.md          Engineering decision log
 └── LEARNING.md           C++ and systems concepts journal
@@ -130,11 +132,13 @@ Implements the [official Binance Spot protocol](https://github.com/binance/binan
 
 ## Concurrency Design
 
+The multithreaded pipeline is used for **offline replay benchmarking only**. The live WebSocket path remains single-threaded on one `io_context`.
+
 ### Lock-free SPSC Queue
 
 The `SpscQueue<T>` is a single-producer single-consumer bounded ring buffer:
 
-- Power-of-two capacity with bitmask indexing (no modulo)
+- Power-of-two capacity with bitmask indexing (no modulo). Requested capacity is rounded up to the next power of two. Extremely large capacities are not validated against `size_t` overflow.
 - `alignas(64)` on head/tail atomics to prevent false sharing
 - `memory_order_release` on publish, `memory_order_acquire` on consume
 - `try_push()` / `try_pop()` — non-blocking, no allocation
@@ -150,23 +154,18 @@ Producer thread          SPSC Queue          Consumer thread
 - Consumer is the sole writer to the OrderBook
 - Producer stops on consumer gap detection (atomic flag)
 - Both stop-on-first-gap for deterministic replay
-- `std::thread::yield()` on spin to reduce CPU waste
+- `std::thread::yield()` on spin to reduce spin iterations (not profiled for CPU utilization)
 - Verified: pipeline produces **identical** book state as sequential replay
 
-### Why the pipeline doesn't outperform sequential
+### Why the pipeline doesn't improve throughput
 
-The consumer bottleneck is `std::map` operations (~9µs per update on a ~10k-level book). The SPSC queue transfer cost (~10-50ns) is negligible in comparison. The pipeline would help if:
-- Parsing were as expensive as book updates (it's 7× faster)
-- Multiple independent books were processed in parallel
-- The book used a cache-friendlier data structure (sorted vector, flat map)
-
-This is documented honestly rather than presented as a performance win.
+The pipeline splits queuing from book application across two threads, but the consumer (order-book updates via `std::map`) is the bottleneck at ~9µs per update. The SPSC queue transfer cost (~10-50ns) is negligible. Adding a thread does not reduce the per-update `std::map` cost — the same work runs on a different core. The pipeline demonstrates correct lock-free producer-consumer design, not a throughput improvement for this workload. Throughput gains would require reducing the per-update cost (e.g., a flatter data structure) or parallelizing across independent books.
 
 ## Performance
 
-**Environment:** Apple M4 Pro, macOS 15, Clang 21, `-O2`, 100k synthetic messages.
+**Environment:** Apple M4 Pro, macOS 15, Clang 21, `-O2`, 100k synthetic messages. All benchmarks use offline replay of pre-parsed data — not live exchange processing.
 
-**Methodology:** 2 warm-up + 5 measured runs, median wall time reported. Per-update latency percentiles from the median-duration run. `steady_clock` for all measurements.
+**Methodology:** 2 warm-up + 5 measured runs, median wall time reported. Per-update latency percentiles from the median-duration run. `steady_clock` for all measurements. Results reflect synthetic data performance, not verified real-market-data throughput.
 
 | Metric | Value |
 |---|---|
@@ -188,18 +187,21 @@ This is documented honestly rather than presented as a performance win.
 ## Recording Live Market Data
 
 ```bash
-# Record 60 seconds of raw depth updates
-MARKET_DATA_RAW=1 timeout 60 ./build/market-data-engine 2>/dev/null > data/live.jsonl
+# Record raw depth updates (Ctrl-C to stop)
+MARKET_DATA_RAW=1 ./build/market-data-engine 2>/dev/null > data/live.jsonl
 
-# Replay and verify
+# Replay recorded data
 ./build/replay_bench data/live.jsonl
 ```
 
-The replay engine strips timestamp prefixes from recorded data. Recorded differential updates without a matching REST snapshot produce an unsynchronized book — the replay starts from an empty book and applies updates sequentially, which is useful for benchmarking parser and book-update performance but does not represent a verified synchronized order book.
+The replay engine strips timestamp prefixes from recorded data. **Important:** Recorded differential updates without a matching REST snapshot do not produce a verified synchronized order book. Offline replay starts from an empty book and applies updates sequentially — the book state converges toward the exchange's state as more price levels are touched, but levels that were never updated remain missing. This mode is useful for benchmarking parser and book-update performance, not for verifying order book accuracy.
 
 ## Testing
 
-**143 tests total**, all passing under ASan+UBSan and ThreadSanitizer:
+**143 tests total** (123 in `test_main.cpp` + 20 in `test_phase2.cpp`):
+
+- **ASan + UBSan:** All 143 tests passed.
+- **ThreadSanitizer:** All 20 Phase 2 tests passed (concurrency-relevant subset).
 
 | Suite | Count | Coverage |
 |---|---|---|
@@ -234,8 +236,8 @@ No additional runtime dependencies. No custom allocators, no external benchmarki
 - No WebSocket reconnection — process exits on disconnect
 - No multi-symbol support (single `btcusdt@depth` stream)
 - No latency instrumentation on the live path
-- Pipeline throughput matches sequential due to `std::map` consumer bottleneck
-- `std::thread::yield()` in spin loops may under-perform on some schedulers
-- Benchmark results are environment-specific
-- Recorded data without snapshots produces unsynchronized book state
+- Pipeline throughput matches sequential — multithreading does not improve this workload
+- `std::thread::yield()` reduces spin iterations but CPU utilization was not profiled
+- Benchmark results are environment-specific and use synthetic data only
+- Recorded data without snapshots does not produce a verified synchronized book
 - Mock server tests skip when local port binding is unavailable
