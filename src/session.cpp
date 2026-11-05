@@ -17,7 +17,7 @@ Session::Session(net::io_context& ioc, ssl::context& ctx,
       port_(std::move(port)),
       path_(std::move(path)),
       on_error_(std::move(on_error)),
-      sync_engine_(std::make_unique<SyncEngine>(ioc, ctx,
+      sync_engine_(std::make_shared<SyncEngine>(ioc, ctx,
                                                  std::move(sync_config))) {}
 
 void Session::run() {

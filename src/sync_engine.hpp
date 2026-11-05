@@ -28,7 +28,7 @@ enum class SyncEvent {
     Resyncing,      // Gap or error detected, restarting sync.
 };
 
-class SyncEngine {
+class SyncEngine : public std::enable_shared_from_this<SyncEngine> {
   public:
     static constexpr std::size_t kMaxBufferSize = 1000;
     static constexpr int kMaxSnapshotRetries = 5;
@@ -38,9 +38,16 @@ class SyncEngine {
         int snapshot_limit = 1000;
         std::string snapshot_host = "api.binance.com";
         std::string snapshot_port = "443";
+        std::string snapshot_connect_host;
         std::chrono::steady_clock::duration http_timeout =
             std::chrono::seconds(10);
         std::chrono::milliseconds base_retry_delay{1000};
+
+        // If empty, snapshot_connect_host defaults to snapshot_host.
+        std::string effective_connect_host() const {
+            return snapshot_connect_host.empty() ? snapshot_host
+                                                 : snapshot_connect_host;
+        }
     };
 
     SyncEngine(net::io_context& ioc, ssl::context& ssl_ctx, Config config);
@@ -60,12 +67,13 @@ class SyncEngine {
     uint64_t first_buffered_U_ = 0;
     bool have_first_event_ = false;
     int snapshot_retries_ = 0;
+    uint64_t sync_gen_ = 0;
     std::shared_ptr<HttpClient> http_client_;
     net::steady_timer retry_timer_;
     bool stopping_ = false;
 
     void request_snapshot();
-    void on_snapshot_response(HttpClient::Result result);
+    void on_snapshot_response(uint64_t gen, HttpClient::Result result);
     void apply_snapshot_and_sync(Snapshot const& snap);
     void begin_resync();
 

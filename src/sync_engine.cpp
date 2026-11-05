@@ -8,7 +8,9 @@ SyncEngine::SyncEngine(net::io_context& ioc, ssl::context& ssl_ctx,
     : ioc_(ioc),
       config_(std::move(config)),
       http_client_(std::make_shared<HttpClient>(
-          ioc, ssl_ctx, config_.snapshot_host, config_.snapshot_port,
+          ioc, ssl_ctx,
+          config_.effective_connect_host(), config_.snapshot_port,
+          config_.snapshot_host,
           config_.http_timeout)),
       retry_timer_(ioc) {}
 
@@ -70,16 +72,19 @@ void SyncEngine::stop() {
 
 void SyncEngine::request_snapshot() {
     state_ = SyncState::SnapshotPending;
+    auto gen = sync_gen_;
 
     http_client_->async_get(
         snapshot_target(),
-        [this, self = http_client_](HttpClient::Result result) {
-            on_snapshot_response(std::move(result));
+        [weak = weak_from_this(), gen](HttpClient::Result result) {
+            if (auto self = weak.lock())
+                self->on_snapshot_response(gen, std::move(result));
         });
 }
 
-void SyncEngine::on_snapshot_response(HttpClient::Result result) {
-    if (stopping_)
+void SyncEngine::on_snapshot_response(uint64_t gen,
+                                      HttpClient::Result result) {
+    if (stopping_ || gen != sync_gen_)
         return;
 
     // Transport error.
@@ -133,11 +138,15 @@ void SyncEngine::on_snapshot_response(HttpClient::Result result) {
                   << "ms\n";
 
         retry_timer_.expires_after(delay);
-        retry_timer_.async_wait([this](beast::error_code ec) {
-            if (ec || stopping_)
-                return;
-            request_snapshot();
-        });
+        retry_timer_.async_wait(
+            [weak = weak_from_this(), gen](beast::error_code ec) {
+                if (ec) return;
+                if (auto self = weak.lock()) {
+                    if (self->stopping_ || gen != self->sync_gen_)
+                        return;
+                    self->request_snapshot();
+                }
+            });
         return;
     }
 
@@ -200,6 +209,7 @@ void SyncEngine::begin_resync() {
     have_first_event_ = false;
     first_buffered_U_ = 0;
     snapshot_retries_ = 0;
+    ++sync_gen_;
     state_ = SyncState::Buffering;
     retry_timer_.cancel();
 }

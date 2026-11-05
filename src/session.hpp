@@ -50,7 +50,7 @@ class Session : public std::enable_shared_from_this<Session> {
 
     ErrorCallback on_error_;
     SessionStats stats_;
-    std::unique_ptr<SyncEngine> sync_engine_;
+    std::shared_ptr<SyncEngine> sync_engine_;
 
   public:
     Session(net::io_context& ioc, ssl::context& ctx,

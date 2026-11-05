@@ -31,6 +31,16 @@ class HttpClient : public std::enable_shared_from_this<HttpClient> {
     using Result = std::variant<Response, std::string>;
     using Callback = std::function<void(Result)>;
 
+    // connect_host/connect_port: where to open the TCP connection.
+    // tls_host: hostname for SNI, certificate verification, and Host header.
+    // When connect_host == tls_host (the common case), pass the same value.
+    HttpClient(net::io_context& ioc, ssl::context& ctx,
+               std::string connect_host, std::string connect_port,
+               std::string tls_host,
+               std::chrono::steady_clock::duration timeout =
+                   std::chrono::seconds(10));
+
+    // Convenience: connect_host == tls_host.
     HttpClient(net::io_context& ioc, ssl::context& ctx,
                std::string host, std::string port,
                std::chrono::steady_clock::duration timeout =
@@ -51,25 +61,29 @@ class HttpClient : public std::enable_shared_from_this<HttpClient> {
     std::optional<http::response_parser<http::string_body>> res_parser_;
     net::steady_timer deadline_;
 
-    std::string host_;
-    std::string port_;
+    std::string connect_host_;
+    std::string connect_port_;
+    std::string tls_host_;
     std::chrono::steady_clock::duration timeout_;
 
     bool connected_ = false;
     bool busy_ = false;
     bool cancelling_ = false;
     bool timed_out_ = false;
+    uint64_t request_gen_ = 0;
     Callback cb_;
 
-    void complete(Result result);
-    void close_connection();
-    void do_resolve();
-    void on_resolve(beast::error_code ec, tcp::resolver::results_type results);
-    void on_connect(beast::error_code ec,
+    void complete(Result result, uint64_t gen);
+    void close_socket();
+    void ensure_fresh_stream();
+    void do_resolve(uint64_t gen);
+    void on_resolve(uint64_t gen, beast::error_code ec,
+                    tcp::resolver::results_type results);
+    void on_connect(uint64_t gen, beast::error_code ec,
                     tcp::resolver::results_type::endpoint_type ep);
-    void on_tls_handshake(beast::error_code ec);
-    void do_request();
-    void on_write(beast::error_code ec, std::size_t bytes);
-    void on_read(beast::error_code ec, std::size_t bytes);
-    void on_deadline(beast::error_code ec);
+    void on_tls_handshake(uint64_t gen, beast::error_code ec);
+    void do_request(uint64_t gen);
+    void on_write(uint64_t gen, beast::error_code ec, std::size_t bytes);
+    void on_read(uint64_t gen, beast::error_code ec, std::size_t bytes);
+    void on_deadline(uint64_t gen, beast::error_code ec);
 };
