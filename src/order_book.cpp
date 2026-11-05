@@ -21,11 +21,8 @@ void OrderBook::apply_snapshot(Snapshot const& snap) {
     bids_.clear();
     asks_.clear();
 
-    for (auto const& level : snap.bids)
-        bids_[level.price] = level.quantity;
-
-    for (auto const& level : snap.asks)
-        asks_[level.price] = level.quantity;
+    apply_levels(bids_, snap.bids);
+    apply_levels(asks_, snap.asks);
 
     update_id_ = snap.last_update_id;
 }
@@ -34,20 +31,22 @@ UpdateResult OrderBook::apply_update(DepthUpdate const& update) {
     if (update.last_update_id <= update_id_)
         return UpdateResult::Stale;
 
-    if (update.first_update_id > update_id_ + 1)
+    // Guard against unsigned overflow: if update_id_ == UINT64_MAX,
+    // update_id_ + 1 wraps to 0, which would accept any U.
+    if (update_id_ == UINT64_MAX || update.first_update_id > update_id_ + 1)
         return UpdateResult::Gap;
 
     apply_levels(bids_, update.bids);
     apply_levels(asks_, update.asks);
     update_id_ = update.last_update_id;
 
-    // Warn on crossed book (best_bid >= best_ask).
+    // Warn on crossed book (best_bid > best_ask). Locked book is not crossed.
     if (!bids_.empty() && !asks_.empty()) {
         auto bb = bids_.rbegin()->first;
         auto ba = asks_.begin()->first;
-        if (bb >= ba) {
+        if (bb > ba) {
             std::cerr << "warning: crossed book (best_bid="
-                      << format_scaled(bb) << " >= best_ask="
+                      << format_scaled(bb) << " > best_ask="
                       << format_scaled(ba) << ")\n";
         }
     }

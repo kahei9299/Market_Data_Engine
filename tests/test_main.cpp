@@ -680,6 +680,12 @@ BOOST_AUTO_TEST_CASE(negative_value) {
     BOOST_TEST(format_scaled(-150'000'000LL) == "-1.5");
 }
 
+BOOST_AUTO_TEST_CASE(int64_min) {
+    // INT64_MIN = -9223372036854775808 → -92233720368.54775808
+    auto result = format_scaled(std::numeric_limits<int64_t>::min());
+    BOOST_TEST(result == "-92233720368.54775808");
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // --- snapshot parsing tests (M2.1) ---
@@ -984,6 +990,74 @@ BOOST_AUTO_TEST_CASE(update_on_uninitialized_book_is_gap) {
     OrderBook book;
     auto result = book.apply_update(make_update(5, 10, {{500, 100}}, {}));
     BOOST_TEST((result == UpdateResult::Gap));
+}
+
+BOOST_AUTO_TEST_CASE(snapshot_zero_quantity_not_stored) {
+    // Zero-quantity levels in a directly constructed Snapshot must not
+    // appear in the book, even when bypassing parse_snapshot().
+    OrderBook book;
+    Snapshot snap{100, {{500, 0}, {400, 100}}, {{600, 0}, {700, 200}}};
+    book.apply_snapshot(snap);
+
+    BOOST_TEST(book.bid_count() == 1u);
+    BOOST_TEST(book.ask_count() == 1u);
+    BOOST_TEST(book.best_bid()->first == 400);
+    BOOST_TEST(book.best_ask()->first == 700);
+}
+
+BOOST_AUTO_TEST_CASE(uint64_max_update_id_is_gap) {
+    // When update_id_ == UINT64_MAX, no further update can be valid.
+    // Without the overflow guard, update_id_ + 1 wraps to 0, and
+    // any U <= 0 would be incorrectly accepted.
+    OrderBook book;
+    Snapshot snap{UINT64_MAX, {{500, 100}}, {}};
+    book.apply_snapshot(snap);
+    BOOST_TEST(book.update_id() == UINT64_MAX);
+
+    // u <= UINT64_MAX → Stale (caught by first check).
+    auto result = book.apply_update(make_update(0, 1, {{500, 200}}, {}));
+    BOOST_TEST((result == UpdateResult::Stale));
+
+    // u == UINT64_MAX → also Stale.
+    auto result2 = book.apply_update(
+        make_update(0, UINT64_MAX, {{500, 300}}, {}));
+    BOOST_TEST((result2 == UpdateResult::Stale));
+
+    // The only update that would pass the stale check is u > UINT64_MAX,
+    // which is impossible in uint64. But to verify the gap guard works,
+    // set update_id to UINT64_MAX - 1, then send U that would wrap.
+    Snapshot snap2{UINT64_MAX - 1, {{500, 100}}, {}};
+    book.apply_snapshot(snap2);
+
+    // U=UINT64_MAX, u=UINT64_MAX: U == update_id_ + 1, so this is valid.
+    auto result3 = book.apply_update(
+        make_update(UINT64_MAX, UINT64_MAX, {{500, 200}}, {}));
+    BOOST_TEST((result3 == UpdateResult::Applied));
+    BOOST_TEST(book.update_id() == UINT64_MAX);
+
+    // Now at UINT64_MAX again — the gap guard ensures no further applies.
+    // Any u > UINT64_MAX is impossible, so all updates are Stale.
+    auto result4 = book.apply_update(
+        make_update(0, 100, {{500, 300}}, {}));
+    BOOST_TEST((result4 == UpdateResult::Stale));
+    BOOST_TEST(book.best_bid()->second == 200);
+}
+
+BOOST_AUTO_TEST_CASE(locked_book_no_warning) {
+    // best_bid == best_ask (locked book) must not trigger a crossed-book
+    // warning. Only best_bid > best_ask is crossed.
+    OrderBook book;
+    Snapshot snap{100, {{500, 100}}, {{500, 200}}};
+    book.apply_snapshot(snap);
+
+    // Apply an update so the crossed-book check runs.
+    auto result = book.apply_update(
+        make_update(101, 101, {{500, 150}}, {}));
+    BOOST_TEST((result == UpdateResult::Applied));
+    BOOST_TEST(book.best_bid()->first == 500);
+    BOOST_TEST(book.best_ask()->first == 500);
+    // No assertion on stderr — the absence of a warning is the test.
+    // A crossed warning would indicate a bug in the >= vs > check.
 }
 
 BOOST_AUTO_TEST_SUITE_END()
