@@ -21,6 +21,36 @@ std::string timestamp_now() {
     return oss.str();
 }
 
+std::string format_scaled(int64_t value) {
+    bool negative = value < 0;
+    // Two's complement: cast to unsigned first to avoid signed overflow on INT64_MIN.
+    uint64_t abs_val = negative
+        ? static_cast<uint64_t>(-(value + 1)) + 1
+        : static_cast<uint64_t>(value);
+
+    auto integer = abs_val / static_cast<uint64_t>(kScaleFactor);
+    auto frac = abs_val % static_cast<uint64_t>(kScaleFactor);
+
+    std::string result;
+    if (negative)
+        result += '-';
+    result += std::to_string(integer);
+
+    if (frac != 0) {
+        // Zero-pad to kDecimalScale digits, then trim trailing zeros.
+        auto frac_digits = std::to_string(frac);
+        // Left-pad with zeros to kDecimalScale digits.
+        std::string padded(kDecimalScale - frac_digits.size(), '0');
+        padded += frac_digits;
+        std::string_view frac_str(padded);
+        auto last_nonzero = frac_str.find_last_not_of('0');
+        result += '.';
+        result.append(frac_str.data(), last_nonzero + 1);
+    }
+
+    return result;
+}
+
 ScaledResult parse_scaled_decimal(std::string_view s) {
     if (s.empty())
         return ScaledParseError{"empty input"};

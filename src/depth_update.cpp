@@ -5,9 +5,6 @@
 
 namespace json = boost::json;
 
-namespace {
-
-// Extract a required uint64 field from a JSON object.
 std::variant<uint64_t, ParseError>
 get_uint64(json::object const& obj, char const* key) {
     auto it = obj.find(key);
@@ -27,9 +24,8 @@ get_uint64(json::object const& obj, char const* key) {
     return val.get_uint64();
 }
 
-// Parse a JSON array of [price_string, quantity_string] pairs into PriceLevels.
 std::variant<std::vector<PriceLevel>, ParseError>
-parse_levels(json::array const& arr, char const* side) {
+parse_levels(json::array const& arr, char const* side, bool skip_zero_qty) {
     std::vector<PriceLevel> levels;
     levels.reserve(arr.size());
 
@@ -74,13 +70,14 @@ parse_levels(json::array const& arr, char const* side) {
             return ParseError{std::string(side) + "[" + std::to_string(i) +
                               "]: quantity must be nonnegative"};
 
+        if (skip_zero_qty && qty == 0)
+            continue;
+
         levels.push_back(PriceLevel{price, qty});
     }
 
     return levels;
 }
-
-} // namespace
 
 ParseResult parse_depth_update(std::string_view data) {
     boost::system::error_code ec;

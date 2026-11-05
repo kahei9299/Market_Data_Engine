@@ -19,3 +19,19 @@ Domain terms for the market-data-engine project. Use these terms consistently in
 ## Numeric Representation
 
 **Scaled integer** — An integer representing a decimal value multiplied by a fixed power of 10. `"78450.06"` at scale 10^8 becomes `7845006000000`. The scale must be explicitly defined, and conversion must reject unsupported precision and overflow.
+
+## Order Book
+
+**Best ask** — The lowest price on the ask side of the order book. Undefined when the ask side is empty.
+
+**Best bid** — The highest price on the bid side of the order book. Undefined when the bid side is empty.
+
+**Depth snapshot** — A REST API response (`GET /api/v3/depth`) containing the complete order book state at a point in time. Contains `lastUpdateId`, bids, and asks. Limited to 5,000 price levels per side. Not a differential update — it replaces the entire book.
+
+**Local order book** — An in-memory representation of the exchange's order book for a single symbol, maintained by applying a depth snapshot followed by differential depth updates. Only correct while synchronized with the exchange's update stream.
+
+**Resynchronization** — The process of discarding the local order book and restarting from a fresh snapshot, triggered by a sequence gap, snapshot failure, or other unrecoverable synchronization error.
+
+**Sequence continuity** — The invariant that each depth update's first update ID (`U`) equals the previous update's last update ID (`u`) plus one. A violation means updates were lost and the local order book is no longer correct.
+
+**Update ID** — A monotonically increasing integer identifying a position in the Binance update stream. Each depth update covers a contiguous range `[U, u]`. Each depth snapshot has a `lastUpdateId`. The local order book tracks the last applied update ID to detect stale or missing events.

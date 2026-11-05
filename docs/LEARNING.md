@@ -533,3 +533,103 @@ Each `substr` creates a new view pointing into the same original memory. Combine
 **Pitfalls:**
 - `string_view` does not own the data. If the original string is destroyed or modified, the view becomes a dangling pointer. In our code this is safe: `data` (the `std::string`) outlives all `string_view`s derived from it within the same `on_read` call.
 - `string_view::substr` does not null-terminate. Functions that require null-terminated input (like `strtol`) can't use it directly. `from_chars` accepts a `[begin, end)` range, which is why it pairs well with `string_view`.
+
+## M2.1 — Order Book Data Structure
+
+### `std::map` as a sorted associative container
+
+**What:** `std::map<Key, Value>` is a red-black tree (self-balancing BST). Keys are always sorted. We use it to maintain price levels sorted by price on each side of the order book.
+
+**Where:** `OrderBook` class in [`src/order_book.hpp`](../src/order_book.hpp) — two members: `bids_` (highest price = best bid via `rbegin()`) and `asks_` (lowest price = best ask via `begin()`).
+
+**Why:** The order book needs sorted prices for best bid/ask retrieval and iteration. `std::map` provides this automatically — no manual sort needed after insert or delete. At ~100 entries per side, the O(log n) overhead is negligible.
+
+**How:** In [`src/order_book.cpp`](../src/order_book.cpp), the `apply_levels` helper handles all three operations with `std::map`'s API:
+
+```cpp
+void apply_levels(std::map<int64_t, int64_t>& side,
+                  std::vector<PriceLevel> const& levels) {
+    for (auto const& level : levels) {
+        if (level.quantity == 0)
+            side.erase(level.price);
+        else
+            side[level.price] = level.quantity;
+    }
+}
+```
+
+- Insert/update: `side[level.price] = level.quantity` — `operator[]` inserts if absent, overwrites if present.
+- Delete: `side.erase(level.price)` — no-op if the key doesn't exist (returns 0).
+- Best price: `bids_.rbegin()` (reverse iterator = highest key), `asks_.begin()` (forward iterator = lowest key). Both are O(1) — the tree tracks its endpoints.
+
+**Pitfalls:**
+- `std::map` iterators remain valid after insert and erase of other elements (unlike `std::vector`). This is important if we later iterate while modifying.
+- `operator[]` on a map inserts a default-constructed value if the key is absent. For `map<int64_t, int64_t>`, the default is 0. We always assign immediately, so this is fine — but using `[]` for read-only access would create phantom entries.
+- `rbegin()` on an empty map returns `rend()`. We check `empty()` before accessing.
+
+### `std::optional` for nullable return values
+
+**What:** `std::optional<T>` holds either a value of type `T` or nothing (`std::nullopt`). We use it for best bid/ask, which have no meaningful value when the book side is empty.
+
+**Where:** `OrderBook::best_bid()` and `OrderBook::best_ask()` in [`src/order_book.hpp`](../src/order_book.hpp) return `std::optional<std::pair<int64_t, int64_t>>`.
+
+**Why:** Returning `std::optional` makes the "no value" case impossible to ignore at the type level. The caller must check `has_value()` or use `->` (which is UB on an empty optional — detected by sanitizers). This is safer than sentinel values (returning price=0 for "no bid" could be mistaken for a real price).
+
+**How:**
+
+```cpp
+std::optional<std::pair<int64_t, int64_t>> OrderBook::best_bid() const {
+    if (bids_.empty())
+        return std::nullopt;
+    auto it = bids_.rbegin();
+    return std::pair{it->first, it->second};
+}
+```
+
+**Pitfalls:**
+- `std::optional` adds one byte of overhead (a boolean flag) plus alignment padding. For a pair of `int64_t`, the optional is 24 bytes. Negligible.
+- Accessing `->first` on an empty optional is UB, not an exception. Use `has_value()` or test with `if (auto bb = book.best_bid())`.
+
+### Enum class for typed return status
+
+**What:** `enum class` provides scoped, strongly-typed enumerations that don't implicitly convert to integers.
+
+**Where:** `UpdateResult` in [`src/order_book.hpp`](../src/order_book.hpp) with values `Applied`, `Stale`, `Gap`.
+
+**Why:** The Binance update procedure has three outcomes. An `enum class` makes each distinct at the type level — you can't accidentally compare `UpdateResult::Gap` with an integer, and the compiler warns if a `switch` doesn't cover all cases.
+
+**How:** `OrderBook::apply_update()` returns `UpdateResult`. The caller switches on it:
+
+```cpp
+auto result = book.apply_update(update);
+switch (result) {
+    case UpdateResult::Applied: /* normal */ break;
+    case UpdateResult::Stale:   /* ignored */ break;
+    case UpdateResult::Gap:     /* resync */ break;
+}
+```
+
+**Pitfalls:**
+- Unlike plain `enum`, `enum class` values cannot be used as integers without `static_cast`. This is intentional — it prevents bugs like `if (result == 0)`.
+- In Boost.Test, comparing `enum class` values requires parentheses: `BOOST_TEST((result == UpdateResult::Applied))`. Without them, the macro's template argument parsing breaks on the `<` in the template.
+
+### Signed integer negation and undefined behavior
+
+**What:** Negating `INT64_MIN` in signed arithmetic is undefined behavior in C++. `INT64_MIN = -9223372036854775808`, and the positive counterpart `9223372036854775808` does not fit in `int64_t` (max is `9223372036854775807`).
+
+**Where:** `format_scaled()` in [`src/util.cpp`](../src/util.cpp) — found during Ponytail code review.
+
+**Why:** The original code was `static_cast<uint64_t>(-value)`. When `value == INT64_MIN`, `-value` overflows `int64_t` before the cast to `uint64_t`. The overflow is UB even though the cast would have produced the correct result on most platforms (two's complement).
+
+**How:** Fixed with `static_cast<uint64_t>(-(value + 1)) + 1`. Adding 1 first moves away from `INT64_MIN` (still in range), negation is safe, cast to unsigned, then add 1 back:
+
+```cpp
+uint64_t abs_val = negative
+    ? static_cast<uint64_t>(-(value + 1)) + 1
+    : static_cast<uint64_t>(value);
+```
+
+**Pitfalls:**
+- Two's complement is guaranteed in C++20 (P0907R4), but signed overflow is still UB. The representation is fixed; the arithmetic rules are not.
+- UBSan catches this at runtime. The test for `format_scaled(-1.5)` would not have triggered it because `-150000000` is far from `INT64_MIN`, but the pattern was still incorrect for the general case.
+- In practice, `format_scaled` is only called with non-negative prices and quantities. The fix is for correctness of the general API contract, not for a current caller.
