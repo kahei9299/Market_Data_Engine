@@ -46,7 +46,7 @@ BOOST_AUTO_TEST_CASE(push_full_returns_false) {
     SpscQueue<int> q(2);
     BOOST_TEST(q.try_push(1));
     BOOST_TEST(q.try_push(2));
-    BOOST_TEST(!q.try_push(3)); // full
+    BOOST_TEST(!q.try_push(3));
 }
 
 BOOST_AUTO_TEST_CASE(fifo_order) {
@@ -62,7 +62,6 @@ BOOST_AUTO_TEST_CASE(fifo_order) {
 
 BOOST_AUTO_TEST_CASE(wraparound) {
     SpscQueue<int> q(4);
-    // Fill and drain multiple times to exercise wraparound.
     for (int round = 0; round < 10; ++round) {
         for (int i = 0; i < 4; ++i)
             BOOST_REQUIRE(q.try_push(round * 10 + i));
@@ -72,6 +71,17 @@ BOOST_AUTO_TEST_CASE(wraparound) {
             BOOST_TEST(*v == round * 10 + i);
         }
     }
+}
+
+BOOST_AUTO_TEST_CASE(capacity_one) {
+    SpscQueue<int> q(1);
+    BOOST_TEST(q.capacity() == 1u);
+    BOOST_TEST(q.try_push(99));
+    BOOST_TEST(!q.try_push(100));
+    auto v = q.try_pop();
+    BOOST_REQUIRE(v.has_value());
+    BOOST_TEST(*v == 99);
+    BOOST_TEST(!q.try_pop().has_value());
 }
 
 BOOST_AUTO_TEST_CASE(concurrent_stress) {
@@ -137,6 +147,7 @@ BOOST_AUTO_TEST_CASE(sequential_replay_applies_updates) {
     BOOST_TEST(result.stats.messages_applied == 3u);
     BOOST_TEST(result.stats.messages_stale == 0u);
     BOOST_TEST(result.stats.messages_gap == 0u);
+    BOOST_TEST(result.stats.complete);
     BOOST_TEST(result.book.update_id() == 3u);
     BOOST_TEST(result.book.bid_count() == 1u);
     BOOST_TEST(result.book.ask_count() == 0u);
@@ -153,18 +164,21 @@ BOOST_AUTO_TEST_CASE(replay_detects_stale) {
     auto result = replay_sequential(updates, 0);
     BOOST_TEST(result.stats.messages_applied == 2u);
     BOOST_TEST(result.stats.messages_stale == 1u);
+    BOOST_TEST(result.stats.complete);
     BOOST_TEST(result.book.best_bid()->second == 60);
 }
 
-BOOST_AUTO_TEST_CASE(replay_detects_gap) {
+BOOST_AUTO_TEST_CASE(replay_stops_on_gap) {
     std::vector<DepthUpdate> updates = {
         make_update(1, 1, {{100, 50}}, {}),
         make_update(5, 5, {{100, 99}}, {}), // gap
+        make_update(6, 6, {{100, 77}}, {}), // never reached
     };
 
     auto result = replay_sequential(updates, 0);
     BOOST_TEST(result.stats.messages_applied == 1u);
     BOOST_TEST(result.stats.messages_gap == 1u);
+    BOOST_TEST(!result.stats.complete);
     BOOST_TEST(result.book.best_bid()->second == 50);
 }
 
@@ -188,9 +202,8 @@ BOOST_AUTO_TEST_CASE(load_and_parse_from_file) {
     BOOST_TEST(stats.parse_errors == 1u);
 
     auto result = replay_sequential(updates, 0);
+    BOOST_TEST(result.stats.complete);
     BOOST_TEST(result.book.update_id() == 2u);
-    BOOST_TEST(result.book.bid_count() == 1u);
-    BOOST_TEST(result.book.ask_count() == 1u);
 
     std::remove(path.c_str());
 }
@@ -206,6 +219,16 @@ BOOST_AUTO_TEST_CASE(empty_file_handled) {
     std::remove(path.c_str());
 }
 
+BOOST_AUTO_TEST_CASE(complete_replay_no_gaps) {
+    std::vector<DepthUpdate> updates;
+    for (uint64_t i = 1; i <= 100; ++i)
+        updates.push_back(make_update(i, i, {{100, static_cast<int64_t>(i)}}, {}));
+
+    auto result = replay_sequential(updates, 0);
+    BOOST_TEST(result.stats.complete);
+    BOOST_TEST(result.stats.messages_applied == 100u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // --- Pipeline tests ---
@@ -218,8 +241,16 @@ static DepthUpdate make_update_p(uint64_t U, uint64_t u,
     return DepthUpdate{"BTCUSDT", 0, U, u, std::move(bids), std::move(asks)};
 }
 
-BOOST_AUTO_TEST_CASE(pipeline_matches_sequential) {
-    // Build a set of updates.
+// Compare full bid/ask contents between two OrderBooks.
+static void assert_books_equal(OrderBook const& a, OrderBook const& b) {
+    BOOST_TEST(a.update_id() == b.update_id());
+    BOOST_TEST(a.bid_count() == b.bid_count());
+    BOOST_TEST(a.ask_count() == b.ask_count());
+    BOOST_TEST((a.bids() == b.bids()));
+    BOOST_TEST((a.asks() == b.asks()));
+}
+
+BOOST_AUTO_TEST_CASE(pipeline_matches_sequential_full_comparison) {
     std::vector<DepthUpdate> updates;
     for (uint64_t i = 1; i <= 1000; ++i) {
         int64_t price = static_cast<int64_t>(70000 + (i % 100)) * 100000000LL;
@@ -230,29 +261,46 @@ BOOST_AUTO_TEST_CASE(pipeline_matches_sequential) {
     auto seq = replay_sequential(updates, 0);
     auto pip = replay_pipeline(updates, 0, 256);
 
-    // Both must produce the same book state.
-    BOOST_TEST(seq.book.update_id() == pip.book.update_id());
-    BOOST_TEST(seq.book.bid_count() == pip.book.bid_count());
-    BOOST_TEST(seq.book.ask_count() == pip.book.ask_count());
-    BOOST_TEST(seq.stats.messages_applied == pip.stats.replay.messages_applied);
-
-    if (seq.book.best_bid() && pip.book.best_bid()) {
-        BOOST_TEST(seq.book.best_bid()->first == pip.book.best_bid()->first);
-        BOOST_TEST(seq.book.best_bid()->second == pip.book.best_bid()->second);
-    }
+    BOOST_TEST(seq.stats.complete);
+    BOOST_TEST(pip.stats.replay.complete);
+    assert_books_equal(seq.book, pip.book);
 }
 
-BOOST_AUTO_TEST_CASE(pipeline_handles_small_queue) {
+BOOST_AUTO_TEST_CASE(pipeline_handles_capacity_one) {
     std::vector<DepthUpdate> updates;
-    for (uint64_t i = 1; i <= 100; ++i)
+    for (uint64_t i = 1; i <= 50; ++i)
         updates.push_back(make_update_p(i, i, {{100, 50}}, {}));
 
-    auto result = replay_pipeline(updates, 0, 4);
-    BOOST_TEST(result.stats.replay.messages_applied == 100u);
-    BOOST_TEST(result.book.update_id() == 100u);
+    auto result = replay_pipeline(updates, 0, 1);
+    BOOST_TEST(result.stats.replay.messages_applied == 50u);
+    BOOST_TEST(result.stats.replay.complete);
 }
 
-BOOST_AUTO_TEST_CASE(pipeline_stress) {
+BOOST_AUTO_TEST_CASE(pipeline_handles_zero_capacity) {
+    // Zero capacity is clamped to 1 internally.
+    std::vector<DepthUpdate> updates;
+    for (uint64_t i = 1; i <= 10; ++i)
+        updates.push_back(make_update_p(i, i, {{100, 50}}, {}));
+
+    auto result = replay_pipeline(updates, 0, 0);
+    BOOST_TEST(result.stats.replay.messages_applied == 10u);
+    BOOST_TEST(result.stats.replay.complete);
+}
+
+BOOST_AUTO_TEST_CASE(pipeline_stops_on_gap) {
+    std::vector<DepthUpdate> updates = {
+        make_update_p(1, 1, {{100, 50}}, {}),
+        make_update_p(5, 5, {{100, 99}}, {}), // gap
+        make_update_p(6, 6, {{100, 77}}, {}), // should not be applied
+    };
+
+    auto result = replay_pipeline(updates, 0, 64);
+    BOOST_TEST(result.stats.replay.messages_gap == 1u);
+    BOOST_TEST(!result.stats.replay.complete);
+    BOOST_TEST(result.book.best_bid()->second == 50);
+}
+
+BOOST_AUTO_TEST_CASE(pipeline_stress_full_comparison) {
     std::vector<DepthUpdate> updates;
     for (uint64_t i = 1; i <= 50000; ++i) {
         int64_t price = static_cast<int64_t>(70000 + (i % 200)) * 100000000LL;
@@ -264,10 +312,9 @@ BOOST_AUTO_TEST_CASE(pipeline_stress) {
     auto seq = replay_sequential(updates, 0);
     auto pip = replay_pipeline(updates, 0, 4096);
 
-    BOOST_TEST(seq.book.update_id() == pip.book.update_id());
-    BOOST_TEST(seq.book.bid_count() == pip.book.bid_count());
-    BOOST_TEST(seq.book.ask_count() == pip.book.ask_count());
-    BOOST_TEST(seq.stats.messages_applied == pip.stats.replay.messages_applied);
+    BOOST_TEST(seq.stats.complete);
+    BOOST_TEST(pip.stats.replay.complete);
+    assert_books_equal(seq.book, pip.book);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -14,6 +14,7 @@ struct ReplayStats {
     uint64_t messages_stale = 0;
     uint64_t messages_gap = 0;
     uint64_t parse_errors = 0;
+    bool complete = false; // true only if all messages processed without gaps
 };
 
 struct ReplayResult {

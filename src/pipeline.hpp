@@ -12,7 +12,7 @@
 #include <vector>
 
 struct PipelineStats {
-    ReplayStats replay;
+    ReplayStats replay; // replay.complete reflects gap-free processing
     uint64_t queue_full_spins = 0;
     uint64_t queue_empty_spins = 0;
     std::chrono::nanoseconds producer_time{0};

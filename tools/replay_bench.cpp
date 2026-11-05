@@ -1,4 +1,4 @@
-// Benchmark: replay, sequential order book, and pipeline throughput/latency.
+// Benchmark: parse, order-book application, and SPSC transfer throughput.
 // Usage: replay_bench <jsonl_file>
 
 #include "depth_update.hpp"
@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -18,6 +17,9 @@
 
 using Clock = std::chrono::steady_clock;
 using ns = std::chrono::nanoseconds;
+
+static constexpr int kWarmupRuns = 2;
+static constexpr int kMeasuredRuns = 5;
 
 struct LatencyStats {
     double mean_ns;
@@ -43,21 +45,9 @@ static LatencyStats compute_latency(std::vector<int64_t>& samples) {
     };
 }
 
-static void print_latency(char const* name, LatencyStats const& s,
-                           uint64_t count, ns wall) {
-    auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall);
-    double throughput = count * 1e9 / wall.count();
-    std::cout << name << ":\n"
-              << "  messages:   " << count << '\n'
-              << "  wall time:  " << wall_ms.count() << " ms\n"
-              << "  throughput: " << std::fixed << std::setprecision(0)
-              << throughput << " msg/s\n"
-              << "  latency:\n"
-              << "    mean: " << std::setprecision(0) << s.mean_ns << " ns\n"
-              << "    p50:  " << s.p50_ns << " ns\n"
-              << "    p95:  " << s.p95_ns << " ns\n"
-              << "    p99:  " << s.p99_ns << " ns\n"
-              << "    max:  " << s.max_ns << " ns\n";
+static ns median_duration(std::vector<ns>& durations) {
+    std::sort(durations.begin(), durations.end());
+    return durations[durations.size() / 2];
 }
 
 int main(int argc, char* argv[]) {
@@ -66,7 +56,6 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Load and parse.
     auto raw = load_messages(argv[1]);
     if (raw.empty()) {
         std::cerr << "no messages loaded\n";
@@ -77,100 +66,140 @@ int main(int argc, char* argv[]) {
     auto updates = parse_messages(raw, parse_stats);
     std::cout << "loaded " << raw.size() << " raw, parsed "
               << updates.size() << " updates ("
-              << parse_stats.parse_errors << " errors)\n\n";
+              << parse_stats.parse_errors << " errors)\n"
+              << "warmup=" << kWarmupRuns << " measured=" << kMeasuredRuns
+              << " (median reported)\n\n";
 
     if (updates.empty()) {
         std::cerr << "no valid updates\n";
         return EXIT_FAILURE;
     }
 
-    // --- Benchmark 1: Parse throughput ---
+    // --- Benchmark 1: Parse-only throughput ---
     {
-        auto start = Clock::now();
-        ReplayStats s;
-        auto parsed = parse_messages(raw, s);
-        auto elapsed = Clock::now() - start;
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
-        double throughput = raw.size() * 1e9 / elapsed.count();
-        std::cout << "parse:\n"
+        for (int i = 0; i < kWarmupRuns; ++i) {
+            ReplayStats s;
+            parse_messages(raw, s);
+        }
+        std::vector<ns> runs;
+        for (int i = 0; i < kMeasuredRuns; ++i) {
+            auto start = Clock::now();
+            ReplayStats s;
+            parse_messages(raw, s);
+            runs.push_back(Clock::now() - start);
+        }
+        auto wall = median_duration(runs);
+        double throughput = raw.size() * 1e9 / wall.count();
+        std::cout << "parse-only throughput:\n"
                   << "  messages:   " << raw.size() << '\n'
-                  << "  wall time:  " << ms.count() << " ms\n"
+                  << "  wall time:  "
+                  << std::chrono::duration_cast<
+                         std::chrono::milliseconds>(wall).count()
+                  << " ms (median of " << kMeasuredRuns << ")\n"
                   << "  throughput: " << std::fixed << std::setprecision(0)
                   << throughput << " msg/s\n\n";
     }
 
-    // --- Benchmark 2: Sequential replay with per-message latency ---
+    // --- Benchmark 2: Sequential order-book application ---
     {
-        std::vector<int64_t> latencies;
-        latencies.reserve(updates.size());
+        // Warm up.
+        for (int i = 0; i < kWarmupRuns; ++i)
+            replay_sequential(updates, 0);
 
-        OrderBook book;
-        Snapshot init{0, {}, {}};
-        book.apply_snapshot(init);
+        std::vector<ns> runs;
+        LatencyStats best_lat{};
+        OrderBook final_book;
 
-        auto wall_start = Clock::now();
-        for (auto const& u : updates) {
-            auto t0 = Clock::now();
-            book.apply_update(u);
-            auto t1 = Clock::now();
-            latencies.push_back(
-                std::chrono::duration_cast<ns>(t1 - t0).count());
+        for (int i = 0; i < kMeasuredRuns; ++i) {
+            std::vector<int64_t> latencies;
+            latencies.reserve(updates.size());
+
+            OrderBook book;
+            Snapshot init{0, {}, {}};
+            book.apply_snapshot(init);
+
+            auto wall_start = Clock::now();
+            for (auto const& u : updates) {
+                auto t0 = Clock::now();
+                book.apply_update(u);
+                auto t1 = Clock::now();
+                latencies.push_back(
+                    std::chrono::duration_cast<ns>(t1 - t0).count());
+            }
+            runs.push_back(Clock::now() - wall_start);
+
+            if (i == kMeasuredRuns / 2) {
+                best_lat = compute_latency(latencies);
+                final_book = std::move(book);
+            }
         }
-        auto wall = Clock::now() - wall_start;
 
-        auto lat = compute_latency(latencies);
-        print_latency("sequential replay", lat, updates.size(), wall);
+        auto wall = median_duration(runs);
+        double throughput = updates.size() * 1e9 / wall.count();
+        std::cout << "sequential order-book application:\n"
+                  << "  messages:   " << updates.size() << '\n'
+                  << "  wall time:  "
+                  << std::chrono::duration_cast<
+                         std::chrono::milliseconds>(wall).count()
+                  << " ms (median of " << kMeasuredRuns << ")\n"
+                  << "  throughput: " << std::fixed << std::setprecision(0)
+                  << throughput << " msg/s\n"
+                  << "  per-update latency (median run):\n"
+                  << "    mean: " << best_lat.mean_ns << " ns\n"
+                  << "    p50:  " << best_lat.p50_ns << " ns\n"
+                  << "    p95:  " << best_lat.p95_ns << " ns\n"
+                  << "    p99:  " << best_lat.p99_ns << " ns\n"
+                  << "    max:  " << best_lat.max_ns << " ns\n";
 
-        auto bb = book.best_bid();
-        auto ba = book.best_ask();
-        std::cout << "  final: update_id=" << book.update_id()
-                  << " bids=" << book.bid_count()
-                  << " asks=" << book.ask_count();
-        if (bb)
-            std::cout << " best_bid=" << format_scaled(bb->first);
-        if (ba)
-            std::cout << " best_ask=" << format_scaled(ba->first);
+        auto bb = final_book.best_bid();
+        auto ba = final_book.best_ask();
+        std::cout << "  final: update_id=" << final_book.update_id()
+                  << " bids=" << final_book.bid_count()
+                  << " asks=" << final_book.ask_count();
+        if (bb) std::cout << " best_bid=" << format_scaled(bb->first);
+        if (ba) std::cout << " best_ask=" << format_scaled(ba->first);
         std::cout << "\n\n";
     }
 
-    // --- Benchmark 3: Pipeline replay ---
+    // --- Benchmark 3: SPSC transfer + order-book application ---
     for (std::size_t qcap : {256, 1024, 4096, 16384}) {
-        auto wall_start = Clock::now();
-        auto result = replay_pipeline(updates, 0, qcap);
-        auto wall = Clock::now() - wall_start;
+        for (int i = 0; i < kWarmupRuns; ++i)
+            replay_pipeline(updates, 0, qcap);
 
-        auto wall_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(wall);
+        std::vector<ns> runs;
+        PipelineResult best_result{};
+
+        for (int i = 0; i < kMeasuredRuns; ++i) {
+            auto start = Clock::now();
+            auto result = replay_pipeline(updates, 0, qcap);
+            runs.push_back(Clock::now() - start);
+            if (i == kMeasuredRuns / 2)
+                best_result = std::move(result);
+        }
+
+        auto wall = median_duration(runs);
         double throughput = updates.size() * 1e9 / wall.count();
 
-        std::cout << "pipeline (queue=" << qcap << "):\n"
+        std::cout << "SPSC transfer + order-book application (queue="
+                  << qcap << "):\n"
                   << "  messages:   " << updates.size() << '\n'
-                  << "  wall time:  " << wall_ms.count() << " ms\n"
+                  << "  wall time:  "
+                  << std::chrono::duration_cast<
+                         std::chrono::milliseconds>(wall).count()
+                  << " ms (median of " << kMeasuredRuns << ")\n"
                   << "  throughput: " << std::fixed << std::setprecision(0)
                   << throughput << " msg/s\n"
-                  << "  applied:    " << result.stats.replay.messages_applied
-                  << '\n'
-                  << "  stale:      " << result.stats.replay.messages_stale
-                  << '\n'
-                  << "  gaps:       " << result.stats.replay.messages_gap
-                  << '\n'
-                  << "  full spins: " << result.stats.queue_full_spins
-                  << '\n'
-                  << "  empty spins:" << result.stats.queue_empty_spins
-                  << '\n'
-                  << "  producer:   "
-                  << std::chrono::duration_cast<
-                         std::chrono::milliseconds>(
-                         result.stats.producer_time).count()
-                  << " ms\n"
-                  << "  consumer:   "
-                  << std::chrono::duration_cast<
-                         std::chrono::milliseconds>(
-                         result.stats.consumer_time).count()
-                  << " ms\n"
-                  << "  final: update_id=" << result.book.update_id()
-                  << " bids=" << result.book.bid_count()
-                  << " asks=" << result.book.ask_count()
+                  << "  applied:    "
+                  << best_result.stats.replay.messages_applied << '\n'
+                  << "  complete:   "
+                  << (best_result.stats.replay.complete ? "yes" : "no") << '\n'
+                  << "  full spins: "
+                  << best_result.stats.queue_full_spins << '\n'
+                  << "  empty spins:"
+                  << best_result.stats.queue_empty_spins << '\n'
+                  << "  final: update_id=" << best_result.book.update_id()
+                  << " bids=" << best_result.book.bid_count()
+                  << " asks=" << best_result.book.ask_count()
                   << "\n\n";
     }
 

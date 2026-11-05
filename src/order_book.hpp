@@ -36,4 +36,6 @@ class OrderBook {
     uint64_t update_id() const { return update_id_; }
     std::size_t bid_count() const { return bids_.size(); }
     std::size_t ask_count() const { return asks_.size(); }
+    std::map<int64_t, int64_t> const& bids() const { return bids_; }
+    std::map<int64_t, int64_t> const& asks() const { return asks_; }
 };

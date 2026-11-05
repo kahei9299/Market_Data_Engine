@@ -51,9 +51,11 @@ ReplayResult replay_sequential(std::vector<DepthUpdate> const& updates,
             break;
         case UpdateResult::Gap:
             result.stats.messages_gap++;
-            break;
+            result.stats.messages_parsed = updates.size();
+            return result;
         }
     }
     result.stats.messages_parsed = updates.size();
+    result.stats.complete = true;
     return result;
 }
