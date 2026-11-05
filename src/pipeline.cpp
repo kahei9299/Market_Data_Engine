@@ -53,6 +53,7 @@ PipelineResult replay_pipeline(std::vector<DepthUpdate> const& updates,
                 break;
             } else {
                 stats.queue_empty_spins++;
+                std::this_thread::yield();
             }
         }
         stats.replay.complete = true;
@@ -67,6 +68,7 @@ PipelineResult replay_pipeline(std::vector<DepthUpdate> const& updates,
             if (consumer_gap.load(std::memory_order_acquire))
                 break;
             stats.queue_full_spins++;
+            std::this_thread::yield();
         }
     }
     producer_done.store(true, std::memory_order_release);

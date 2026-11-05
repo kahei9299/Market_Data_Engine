@@ -1,228 +1,241 @@
 # Market Data Engine
 
-A low-latency C++20 market-data engine that ingests live exchange data, reconstructs a local order book, and measures processing performance.
+A production-oriented C++20 market-data engine that ingests live Binance exchange data over WebSocket, reconstructs a synchronized local order book using REST snapshots, and provides deterministic offline replay with measured performance characteristics.
 
-Built incrementally as a learning project for C++ systems engineering: networking, memory management, concurrency, and profiling.
-
-## Current status
-
-| Milestone | Description | Status |
-|---|---|---|
-| **M1.1** | Live WebSocket receiver | Complete |
-| **M1.2** | Typed depth message parsing | Complete |
-| **M2** | Order book reconstruction | Complete |
-| **M2.1** | Order book data structure | Complete |
-| **M2.2** | Asynchronous HTTPS client | Complete |
-| **M2.3** | Synchronization engine | Complete |
-| **M2.4** | Session integration | Complete |
-| **Phase 2** | Replay, benchmarking, concurrency | Complete |
+Built as a systems engineering project demonstrating: async networking, TLS security, protocol-correct exchange integration, lock-free concurrency, and reproducible benchmarking.
 
 ## Architecture
 
-M1.2 adds a typed parsing layer between the WebSocket receiver and output:
-
 ```
-Binance WebSocket API                     market-data-engine
-(stream.binance.com:9443)                 (single process, single thread)
+Live path                                    Offline path
 
-  wss://...@depth ──────────────────────▸ Session
-                    TLS + WebSocket         │
-                    ~1 msg/sec              ├─▸ parse_depth_update()
-                                            │     JSON → DepthUpdate struct
-                                            │     decimal strings → scaled int64
-                                            │     validates all fields
-                                            │
-                                            ├─▸ decoded summary → stderr
-                                            │     symbol, U, u, bid/ask counts, E
-                                            │
-                                            ├─▸ [raw JSON → stdout if MARKET_DATA_RAW=1]
-                                            │
-                                            └─▸ stats tracking
-                                          
-                                          main()
-                                            ├─▸ io_context::run()  (event loop)
-                                            ├─▸ signal_set          (Ctrl-C)
-                                            └─▸ error callback      (fatal → exit)
+Binance WebSocket API                        JSONL file
+(stream.binance.com:9443)                    (recorded depth updates)
+        │                                           │
+        ▼                                           ▼
+   Session (async TLS WebSocket)             load_messages()
+        │                                           │
+        ▼                                           ▼
+   parse_depth_update()                      parse_messages()
+   JSON → DepthUpdate struct                 JSON → DepthUpdate vector
+   decimal strings → int64 (×10⁸)                   │
+        │                                    ┌──────┴──────┐
+        ▼                                    ▼              ▼
+   SyncEngine                          Sequential      Pipeline
+   ├─ State: Buffering → Snapshot      replay          (SPSC queue)
+   │         Pending → Synchronized    ┌────────┐    ┌────────────┐
+   ├─ HttpClient (REST snapshot)       │ Order  │    │ Producer → │
+   ├─ Bounded event buffer             │ Book   │    │ SPSC queue │
+   └─ Gap detection → resync           │(single)│    │ → Consumer │
+        │                              └────────┘    │ → OrderBook│
+        ▼                                            └────────────┘
+   OrderBook
+   ├─ std::map<price, qty> × 2 sides
+   ├─ apply_update() → Applied|Stale|Gap
+   └─ best_bid() / best_ask()
 ```
 
-**Data flow:** Binance sends differential depth updates over a TLS WebSocket connection. `Session` receives each message into a bounded 1 MB buffer. `parse_depth_update()` parses the JSON into a typed `DepthUpdate` struct, converting decimal price/quantity strings to scaled `int64_t` values (scale 10^8) without floating-point. On success, a one-line decoded summary is printed to stderr. On failure, the parse error is logged and the invalid-message counter incremented. On Ctrl-C, `Session::stop()` sends a WebSocket Close frame and prints session statistics.
-
-**Raw JSON debugging:** Set `MARKET_DATA_RAW=1` to print timestamped raw JSON to stdout alongside the decoded summary.
-
-**Threading model:** Single-threaded. One `io_context::run()` call processes all async completions sequentially.
+**Threading model:** Single-threaded `io_context` event loop for the live path. The pipeline uses two threads (producer + consumer) with a lock-free SPSC queue.
 
 ## Building
 
 Requires macOS with Homebrew, CMake 3.20+, and a C++20 compiler.
 
 ```bash
-# install dependencies
+# Install dependencies
 brew install boost ninja
 
-# build
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+# Build (Release for benchmarks, Debug for development)
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
 
-# run tests
-./build/tests
+# Run tests
+./build/tests          # M1/M2 tests (123 cases)
+./build/tests_phase2   # Replay/concurrency tests (20 cases)
 
-# run the live receiver (Ctrl-C to stop)
+# Run live receiver (Ctrl-C to stop)
 ./build/market-data-engine
 
-# run with raw JSON output
-MARKET_DATA_RAW=1 ./build/market-data-engine
+# Record live data for offline replay
+MARKET_DATA_RAW=1 timeout 60 ./build/market-data-engine 2>/dev/null > data/live.jsonl
+
+# Generate synthetic test data
+./build/generate_data 100000 data/depth_100k.jsonl
+
+# Run benchmarks
+./build/replay_bench data/depth_100k.jsonl
+```
+
+### Sanitizer builds
+
+```bash
+# AddressSanitizer + UndefinedBehaviorSanitizer
+cmake -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+ninja -C build-asan && ./build-asan/tests && ./build-asan/tests_phase2
+
+# ThreadSanitizer (concurrency tests)
+cmake -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+ninja -C build-tsan tests_phase2 && ./build-tsan/tests_phase2
 ```
 
 ## Project structure
 
 ```
 src/
-├── main.cpp              Entry point, io_context, signal handling, error callback
-├── session.hpp/cpp       Async WebSocket session (connect, TLS, read loop)
-├── depth_update.hpp/cpp  DepthUpdate types, strict JSON parser, shared parse helpers
-├── order_book.hpp/cpp    OrderBook class (bid/ask maps, update procedure, snapshot application)
-├── snapshot.hpp/cpp      Snapshot type and REST depth response parser
-├── http_client.hpp/cpp   Async HTTPS client (persistent connection, lazy reconnection, TLS verification)
-├── sync_engine.hpp/cpp   Snapshot sync state machine (buffering, retry, gap detection)
+├── main.cpp              Entry point, io_context, signal handling
+├── session.hpp/cpp       Async WebSocket session (TLS, read loop, SyncEngine integration)
+├── sync_engine.hpp/cpp   Binance 7-step sync protocol (state machine, retry, gap detection)
+├── http_client.hpp/cpp   Async HTTPS client (persistent connection, TLS, deadline timer)
+├── order_book.hpp/cpp    OrderBook (std::map bid/ask sides, update procedure)
+├── depth_update.hpp/cpp  DepthUpdate parser, shared parse helpers
+├── snapshot.hpp/cpp      REST depth snapshot parser
 ├── replay.hpp/cpp        Deterministic offline replay engine
 ├── spsc_queue.hpp        Lock-free SPSC ring buffer (header-only)
 ├── pipeline.hpp/cpp      Producer-consumer pipeline using SPSC queue
-└── util.hpp/cpp          Timestamp formatting, scaled decimal parser and formatter
+└── util.hpp/cpp          Timestamp, scaled decimal parser/formatter
 tools/
 ├── generate_data.cpp     Synthetic depth update generator
-└── replay_bench.cpp      Benchmark executable (parse, replay, pipeline)
+└── replay_bench.cpp      Benchmark harness (parse, replay, pipeline)
 tests/
-├── test_main.cpp         123 unit tests (Boost.Test) — M1/M2
-└── test_phase2.cpp       15 unit tests — replay, SPSC queue, pipeline (138 total)
-data/                     Generated test data (gitignored)
+├── test_main.cpp         143 tests: parsing, order book, networking, sync
+└── test_phase2.cpp       20 tests: SPSC queue, replay, pipeline correctness
 docs/
-├── DECISIONS.md          Engineering decisions log
+├── DECISIONS.md          Engineering decision log
 └── LEARNING.md           C++ and systems concepts journal
-GLOSSARY.md               Domain terminology
 ```
 
-## Features
+## Binance Order Book Synchronization
 
-### M1.1 — Live WebSocket Receiver
+Implements the [official Binance Spot protocol](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md#how-to-manage-a-local-order-book-correctly):
 
-- Async WebSocket connection to `wss://stream.binance.com:9443/ws/btcusdt@depth`
-- TLS certificate validation (`verify_peer`) and hostname verification (`SSL_set1_host`)
-- Automatic WebSocket ping/pong via Beast `timeout::suggested`
-- Bounded receive buffer (1 MB) to prevent memory exhaustion
-- Session diagnostics printed on shutdown (uptime, message count, bytes, invalid messages)
-- Clean shutdown on SIGINT/SIGTERM with WebSocket Close frame
-- Shutdown guards in every async callback to prevent operations after stop
-- Fatal errors exit with nonzero status via error callback and signal cancellation
+1. Open WebSocket to `btcusdt@depth`, buffer incoming events
+2. On first event, note `U` and request REST snapshot (`GET /api/v3/depth`)
+3. If snapshot `lastUpdateId < first_U` → stale, retry with exponential backoff
+4. Discard buffered events where `u ≤ lastUpdateId`
+5. Apply snapshot to book (`update_id = lastUpdateId`)
+6. Apply remaining buffered events, then live events
+7. On sequence gap (`U > update_id + 1`) → full resynchronization
 
-### M1.2 — Typed Depth Message Parsing
+**State machine:** `Buffering → SnapshotPending → Synchronized`, with resync on any failure.
 
-- Strongly typed `DepthUpdate` and `PriceLevel` structs with clear ownership
-- Prices and quantities as signed 64-bit scaled integers (scale 10^8, no floating-point)
-- Strict parsing: validates event type, symbol, timestamps, sequence IDs, and decimal format
-- Rejects invalid sequence ranges (`U > u`), zero prices, negative quantities, overflow, and excess precision
-- Atomic parse failure — returns `ParseError` variant, never a partial `DepthUpdate`
-- Zero-quantity deletion updates accepted (Binance protocol for removing price levels)
-- Raw JSON debugging via `MARKET_DATA_RAW=1` environment variable
-- 90 unit tests covering scaled decimal parsing (including INT64_MAX boundary, negative zero), depth update parsing (including empty symbol, fractional overflow), snapshot parsing, order book operations, format_scaled, and M1.1 networking/lifecycle
+**Key invariants:**
+- Prices as signed `int64_t` scaled by 10⁸ (exact decimal, no floating-point)
+- Zero-quantity updates delete the price level
+- Atomic parse failure — never a partial `DepthUpdate`
+- Single-writer OrderBook (SyncEngine or consumer thread)
 
-### M2.1 — Order Book Data Structure
+## Concurrency Design
 
-- `OrderBook` class with `std::map<int64_t, int64_t>` for bids (descending) and asks (ascending)
-- Snapshot application: full book replacement with update ID tracking
-- Differential update application per Binance protocol (Applied, Stale, Gap detection)
-- Best bid/ask retrieval as `std::optional<std::pair<int64_t, int64_t>>`
-- Crossed book detection (best bid >= best ask) with stderr warning
-- `Snapshot` struct and `parse_snapshot()` parser for REST `/api/v3/depth` responses
-- Zero-quantity snapshot entries silently skipped
-- `format_scaled()` utility for converting scaled integers to human-readable decimals
-- Shared `parse_levels()` and `get_uint64()` helpers extracted from M1.2 for reuse
-- 35 new unit tests (90 total)
+### Lock-free SPSC Queue
 
-### M2.2 — Asynchronous HTTPS Client
+The `SpscQueue<T>` is a single-producer single-consumer bounded ring buffer:
 
-- `HttpClient` class with async GET via Boost.Beast on the existing `io_context`
-- Persistent HTTP/1.1 connection with lazy reconnection on failure
-- TLS certificate-chain verification, hostname verification (`SSL_set1_host`), and SNI
-- 10-second end-to-end deadline via `net::steady_timer` (configurable for tests)
-- Centralized completion path — exactly one callback per request
-- Overlapping `async_get()` calls rejected with busy error
-- HTTP response body limit (2 MB) via `http::response_parser::body_limit`
-- Connection-close semantics respected for connection reuse decisions
-- Fresh TLS session state on reconnection via stream reconstruction
-- `cancel()` for clean shutdown with explicit cancelled result
-- 9 new deterministic tests using local mock HTTPS server (103 total)
+- Power-of-two capacity with bitmask indexing (no modulo)
+- `alignas(64)` on head/tail atomics to prevent false sharing
+- `memory_order_release` on publish, `memory_order_acquire` on consume
+- `try_push()` / `try_pop()` — non-blocking, no allocation
+- Backpressure: producer yields on full queue
 
-### M2.3/M2.4 — Synchronization Engine and Session Integration
+### Pipeline
 
-- `SyncEngine` class implementing the official Binance 7-step local order book sync protocol
-- State machine: Buffering → SnapshotPending → Synchronized with resync on failure
-- Bounded update buffer (`std::deque<DepthUpdate>`, max 1000 events, resync on overflow)
-- Exponential backoff on stale snapshots (5 retries, 1s base, 2× multiplier)
-- Sequence gap detection triggers full resynchronization
-- Snapshot validation: stale check, bridging event detection, buffered event replay
-- HTTP error, parse error, and transport failure handling with automatic resync
-- Session integration: parsed depth updates routed through SyncEngine
-- Best bid/ask with spread printed on every applied update when synchronized
-- Graceful shutdown via `SyncEngine::stop()` cancelling HTTP requests and timers
-- 11 new deterministic tests with mock HTTPS server (114 total)
+```
+Producer thread          SPSC Queue          Consumer thread
+(push DepthUpdates) ──→ [ring buffer] ──→ (apply to OrderBook)
+```
 
-### Phase 2 — Replay, Benchmarking, and Concurrency
+- Consumer is the sole writer to the OrderBook
+- Producer stops on consumer gap detection (atomic flag)
+- Both stop-on-first-gap for deterministic replay
+- `std::thread::yield()` on spin to reduce CPU waste
+- Verified: pipeline produces **identical** book state as sequential replay
 
-**Deterministic replay:**
-- Offline replay from JSONL files (one depth update JSON per line)
-- Reuses existing parser and OrderBook — no logic duplication
-- Tracks applied, stale, gap, and parse error counts
-- Deterministic: identical input produces identical book state
+### Why the pipeline doesn't outperform sequential
 
-**Benchmarking:**
-- Custom benchmark harness measuring parse throughput, sequential replay latency, and pipeline throughput
-- Per-message latency with p50/p95/p99/max percentiles
-- Release-build optimized measurements
+The consumer bottleneck is `std::map` operations (~9µs per update on a ~10k-level book). The SPSC queue transfer cost (~10-50ns) is negligible in comparison. The pipeline would help if:
+- Parsing were as expensive as book updates (it's 7× faster)
+- Multiple independent books were processed in parallel
+- The book used a cache-friendlier data structure (sorted vector, flat map)
 
-**Measured results (Apple M4 Pro, macOS, Release build, 100k synthetic messages):**
+This is documented honestly rather than presented as a performance win.
+
+## Performance
+
+**Environment:** Apple M4 Pro, macOS 15, Clang 21, `-O2`, 100k synthetic messages.
+
+**Methodology:** 2 warm-up + 5 measured runs, median wall time reported. Per-update latency percentiles from the median-duration run. `steady_clock` for all measurements.
 
 | Metric | Value |
 |---|---|
-| Parse throughput | ~835k msg/s |
-| Sequential replay throughput | ~110k msg/s |
-| Sequential p50 latency | ~8.8 µs |
-| Sequential p95 latency | ~11 µs |
-| Sequential p99 latency | ~13.6 µs |
-| Pipeline throughput (queue=4096) | ~110k msg/s |
+| **Parse-only throughput** | 801k msg/s |
+| **Sequential order-book application** | 111k msg/s |
+| Per-update mean latency | 8,972 ns |
+| Per-update p50 latency | 8,708 ns |
+| Per-update p95 latency | 11,208 ns |
+| Per-update p99 latency | 13,625 ns |
+| **SPSC + book application (q=4096)** | 109k msg/s |
 
-**Lock-free SPSC queue:**
-- Power-of-two ring buffer with atomic head/tail
-- Cache-line-aligned (64 bytes) to avoid false sharing
-- Release/acquire memory ordering
-- `try_push` / `try_pop` — no blocking, no allocation
+**Bottleneck:** `std::map::operator[]` and `std::map::erase` at O(log n) with ~10k entries. Each update modifies 1-5 price levels, requiring ~13 key comparisons per operation plus node allocation.
 
-**Producer-consumer pipeline:**
-- Producer thread pushes parsed DepthUpdates into SPSC queue
-- Consumer thread pops and applies to OrderBook (single writer)
-- Busy-wait spin on backpressure (queue full) and starvation (queue empty)
-- Verified: pipeline produces identical book state as sequential replay
-- ThreadSanitizer clean
+**Limitations:**
+- Synthetic data has ~10k unique prices (wider than a typical real book)
+- `steady_clock` overhead (~20-40ns) included in per-message measurements
+- Single machine, single run configuration
 
-## Known limitations
+## Recording Live Market Data
 
-- No reconnection on WebSocket disconnect — process exits on connection error
-- No multi-symbol support
-- No latency measurement instrumentation
-- Scale factor hardcoded to 10^8 — sufficient for all current Binance Spot pairs
-- `timestamp_now()` uses `gmtime_r` (POSIX) — not portable to Windows
-- Namespace aliases in `session.hpp` leak into includers
-- Hostname mismatch integration test requires local port binding (skipped in sandboxed environments)
-- Pipeline throughput matches sequential because the bottleneck is `std::map` operations on a ~10k-level book, not inter-thread communication
-- Busy-wait spin in pipeline consumes CPU when producer outpaces consumer
-- Benchmark results are environment-specific (Apple M4 Pro); results will vary by hardware
-- No NUMA-aware allocation
+```bash
+# Record 60 seconds of raw depth updates
+MARKET_DATA_RAW=1 timeout 60 ./build/market-data-engine 2>/dev/null > data/live.jsonl
+
+# Replay and verify
+./build/replay_bench data/live.jsonl
+```
+
+The replay engine strips timestamp prefixes from recorded data. Recorded differential updates without a matching REST snapshot produce an unsynchronized book — the replay starts from an empty book and applies updates sequentially, which is useful for benchmarking parser and book-update performance but does not represent a verified synchronized order book.
+
+## Testing
+
+**143 tests total**, all passing under ASan+UBSan and ThreadSanitizer:
+
+| Suite | Count | Coverage |
+|---|---|---|
+| Scaled decimal parsing | 20 | Precision, overflow, INT64_MAX boundary, negative zero |
+| Depth update parsing | 24 | Valid/invalid JSON, field validation, atomic failure |
+| Snapshot parsing | 10 | REST response, zero-qty filtering, malformed data |
+| Order book operations | 21 | Insert/update/delete, gap/stale, crossed book, UINT64_MAX |
+| TLS and networking | 1+ | Hostname verification, connection lifecycle |
+| HttpClient | 9 | GET, reuse, timeout, cancel, TLS mismatch, stale recovery |
+| SyncEngine | 11 | Sync protocol, retry, buffer overflow, generation isolation |
+| Lifetime regression | 9 | Async lifetime, abort recovery, resource safety |
+| SPSC queue | 9 | Capacity, FIFO, wraparound, concurrent stress |
+| Replay | 6 | Sequential, gap stop, file I/O, completeness |
+| Pipeline | 5 | Correctness vs sequential, gap stop, edge capacities |
+
+Mock HTTPS server tests require local port binding (skipped in sandboxed CI).
 
 ## Dependencies
 
 | Library | Purpose |
 |---|---|
-| [Boost.Beast](https://www.boost.org/doc/libs/release/libs/beast/) | WebSocket protocol and HTTP upgrade |
-| [Boost.Asio](https://www.boost.org/doc/libs/release/libs/asio/) | Async I/O, TCP, DNS, signal handling |
-| [Boost.JSON](https://www.boost.org/doc/libs/release/libs/json/) | JSON parsing for depth update messages |
+| [Boost.Beast](https://www.boost.org/doc/libs/release/libs/beast/) | WebSocket and HTTP protocol |
+| [Boost.Asio](https://www.boost.org/doc/libs/release/libs/asio/) | Async I/O, TCP, DNS, signals, timers |
+| [Boost.JSON](https://www.boost.org/doc/libs/release/libs/json/) | JSON parsing |
 | [OpenSSL](https://www.openssl.org/) | TLS encryption, certificate verification |
-| [Boost.Test](https://www.boost.org/doc/libs/release/libs/test/) | Unit testing framework |
+| [Boost.Test](https://www.boost.org/doc/libs/release/libs/test/) | Unit testing |
+
+No additional runtime dependencies. No custom allocators, no external benchmarking frameworks.
+
+## Known Limitations
+
+- No WebSocket reconnection — process exits on disconnect
+- No multi-symbol support (single `btcusdt@depth` stream)
+- No latency instrumentation on the live path
+- Pipeline throughput matches sequential due to `std::map` consumer bottleneck
+- `std::thread::yield()` in spin loops may under-perform on some schedulers
+- Benchmark results are environment-specific
+- Recorded data without snapshots produces unsynchronized book state
+- Mock server tests skip when local port binding is unavailable

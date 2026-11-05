@@ -12,8 +12,13 @@ std::vector<std::string> load_messages(std::string const& path) {
     }
     std::string line;
     while (std::getline(in, line)) {
-        if (!line.empty())
-            lines.push_back(std::move(line));
+        if (line.empty())
+            continue;
+        // Strip optional timestamp prefix: "[2024-01-01T00:00:00.000Z] {...}"
+        auto brace = line.find('{');
+        if (brace != std::string::npos && brace > 0)
+            line = line.substr(brace);
+        lines.push_back(std::move(line));
     }
     return lines;
 }
