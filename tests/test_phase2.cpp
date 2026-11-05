@@ -84,6 +84,18 @@ BOOST_AUTO_TEST_CASE(capacity_one) {
     BOOST_TEST(!q.try_pop().has_value());
 }
 
+BOOST_AUTO_TEST_CASE(large_capacity) {
+    SpscQueue<int> q(1 << 16); // 65536
+    BOOST_TEST(q.capacity() == 65536u);
+    for (int i = 0; i < 1000; ++i)
+        BOOST_REQUIRE(q.try_push(i));
+    for (int i = 0; i < 1000; ++i) {
+        auto v = q.try_pop();
+        BOOST_REQUIRE(v.has_value());
+        BOOST_TEST(*v == i);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(concurrent_stress) {
     SpscQueue<uint64_t> q(1024);
     constexpr uint64_t N = 100000;
